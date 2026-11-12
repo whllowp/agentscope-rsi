@@ -73,6 +73,7 @@ class RSIMiddleware(MiddlewareBase):
             self.ctx.config,
             session_id=session,
             query=query,
+            events=getattr(self.ctx, "events", None),
         )
         self._recorders[session] = recorder
         finished_reason = ""

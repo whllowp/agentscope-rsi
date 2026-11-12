@@ -40,6 +40,9 @@ _CHARS_PER_TOKEN = 2.0
 """注入字符 → token 的粗折算（中文偏保守）。"""
 _COVERAGE_PENALTY = 0.2
 """丢失一条成功轨迹用过的记忆对质量的惩罚（0..1 区间内扣减）。"""
+_SOP_COVERAGE_BONUS = 0.1
+"""候选激活的 SOP 触发词命中有据可查的近期轨迹查询时，给质量的
+确定性加成（E0：SOP-查询对齐度，RSI-Anything 的预测性收益信号）。"""
 
 _JUDGE_SYSTEM = (
     "你是 Agent 自我改进的回放评审员。基于给出的【证据】（真实轨迹"
@@ -161,6 +164,12 @@ class ReplayEvaluator:
             if scored else 0.5
         )
 
+        # ---- SOP 触发覆盖加成（E0 确定性）：候选激活的 SOP 与近期
+        # ---- 查询的对齐度越高，预期质量加成越大。
+        sop_coverage = await self._sop_trigger_coverage(
+            candidate, sample,
+        )
+
         judge_delta, judge_reason = 0.0, ""
         model = judge_model or self._config.backend_model
         if model is not None and candidate.operator != "seed":
@@ -173,6 +182,7 @@ class ReplayEvaluator:
             min(
                 1.0,
                 base_quality * coverage
+                + _SOP_COVERAGE_BONUS * sop_coverage
                 + 0.15 * max(-1.0, min(1.0, judge_delta)),
             ),
         )
@@ -199,6 +209,7 @@ class ReplayEvaluator:
             components={
                 "base_quality": round(base_quality, 4),
                 "coverage": round(coverage, 4),
+                "sop_coverage": round(sop_coverage, 4),
                 "judge_delta": round(judge_delta, 4),
                 "est_tokens_mean": round(mean_tokens, 1),
             },
@@ -212,6 +223,40 @@ class ReplayEvaluator:
             judge_reason=judge_reason,
             details={"traces_evaluated": len(sample)},
         )
+
+    async def _sop_trigger_coverage(
+        self,
+        candidate: GenomeSpec,
+        traces: list[TraceRecord],
+    ) -> float:
+        """候选激活 SOP 的触发词对近期轨迹查询的覆盖率（0..1）。
+
+        确定性计算（E0）：加载 ``active_sops`` 对应的肌肉记忆条目，
+        统计查询被任一触发词（子串语义）命中的轨迹占比。SOP 候选
+        以 ``status=candidate`` 存库，同样参与计算。
+        """
+        if not candidate.active_sops or not traces:
+            return 0.0
+        sops = []
+        for mid in candidate.active_sops:
+            rec = await self._db.get_memory(mid)
+            if (
+                rec is not None
+                and rec.tier == "muscle"
+                and rec.status in ("active", "candidate", "promoted")
+            ):
+                sops.append(rec)
+        if not sops:
+            return 0.0
+        hit = 0
+        for t in traces:
+            q = t.query.casefold()
+            if any(
+                tr.casefold() in q
+                for s in sops for tr in s.triggers
+            ):
+                hit += 1
+        return hit / len(traces)
 
     async def _judge(
         self,

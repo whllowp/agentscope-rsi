@@ -18,6 +18,7 @@ from ..storage import (
     ToolCallNode,
     TraceRecord,
 )
+from ..telemetry import CAT_TRACE, LocalEventLog
 
 
 def score_outcome(
@@ -52,9 +53,11 @@ class TraceRecorder:
         *,
         session_id: str | None,
         query: str,
+        events: LocalEventLog | None = None,
     ) -> None:
         self._db = db
         self._config = config
+        self._events = events
         self.record = TraceRecord(session_id=session_id, query=query)
 
     def add_model_call(self, stat: ModelCallStat) -> None:
@@ -122,6 +125,20 @@ class TraceRecorder:
             },
         )
         await self.upsert()
+        if self._events is not None:
+            self._events.emit_sync(
+                CAT_TRACE,
+                {
+                    "trace_id": self.record.id,
+                    "session_id": self.record.session_id,
+                    "query": self.record.query[:120],
+                    "score": self.record.outcome.score,
+                    "tokens": self.record.total_tokens,
+                    "tool_calls": len(calls),
+                    "tool_error_ratio": round(error_ratio, 3),
+                    "max_iters_exceeded": max_iters_exceeded,
+                },
+            )
         return self.record
 
     async def upsert(self) -> None:

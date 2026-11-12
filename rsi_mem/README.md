@@ -138,6 +138,10 @@ app = create_app(..., extra_agent_middlewares=build_middleware_factory())
 | Harmony：证据完整性门 | 诊断引用的轨迹 id 全部对库校验，伪造引用直接丢弃 |
 | Harmony：三段校验 + 一次修复 + 回滚 | `rsi/validator.py`：结构段（schema/上限）→ 冒烟段（SOP 引用存在、序列化往返）→ 完整性段（**锁定安全片段逐字保留**、拒绝空演化）；`rsi_evolve(rollback=True)` 一键回滚 |
 | Harmony：gen/env 作用域 | `generalize` 算子做会话 SOP → 全局反射晋升；记忆条目带 `scope` 字段 |
+| **RSI-Anything：世界模型** | `rsi/predictor.py` 候选执行**前**预测三目标增量（特征=候选 vs 父代结构差）；预测-观测对写 `predictions` 表并按算子在线校准（MAE/不确定性随样本下降） |
+| **RSI-Anything：保留门** | ① 可靠性门：预测样本足够且 MAE 超阈 → 保守模式（仅放行 `retrieval_evolve` 小步候选）直至重新校准；② pair gate：胜者部署前再做一次组装态终校验 |
+| **RSI-Anything：E0-E3 分级证据** | `rsi/evidence.py` —— E0 规则检查 / E1 模型预测 / E2 模拟回放 / E3 真实测量，诊断与 dream 报告逐信号标注（doctor 按证据强度排序发现） |
+| **RSI-Anything：域适配器插件化** | `rsi/plugins.py` —— 计划生成收敛到 `PluginRegistry`，内置改进器也只是插件；第三方经 `rsi.plugins=["pkg:Plugin"]` 或 entry points `rsi_mem.plugins` 注入，**无法绕过校验与非退化门** |
 
 **演化对象是声明式基因组**（`GenomeSpec`：提示词片段 + 检索参数 + 激活
 SOP 集），不是任意代码——这是"不改动源码"约束下的安全演化边界。RSI
@@ -199,10 +203,13 @@ RSIMemConfig(
 ## 测试
 
 ```bash
-python -m pytest rsi_mem/tests -q   # 34 个用例，全部离线
+python -m pytest rsi_mem/tests -q   # 47 个用例，全部离线
 ```
 
 覆盖：FTS 中文检索、TTL/LRU、链接展开、晋升溯源、分级确认、SOP 蒸馏、
 锁定片段防护、空演化拒绝、悬挂引用修复、回放回归检出、**非退化保障**、
 回滚、中间件 e2e（真实 Agent + 假模型）、HTTP 代理注入与轨迹、mock 模型
-全链路组装。
+全链路组装，以及本轮新增：**插件注册表（含坏插件容错）**、**预测器
+先验→校准→可靠性门**、**保守模式拦截高风险计划**、**预测持久化回填**、
+**本地事件日志与 langfuse 桥（含假客户端）**、**诊断证据分级**、
+**10 轮基准非退化断言**、**CLI doctor/report**。

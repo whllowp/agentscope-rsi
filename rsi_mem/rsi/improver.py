@@ -184,13 +184,23 @@ class Improver:
         # 1) 高工具错误率 → 从成功序列蒸馏 SOP
         if stats.get("tool_error_ratio", 0) > 0.25 and ok_tools:
             seq = " → ".join(list(ok_tools)[:4])
+            # 触发词除工具名外，取最近成功轨迹的查询前缀，
+            # 让 SOP 能命中同类问题（对 CJK 查询尤其重要）
+            best_query = ""
+            if diagnosis.get("best_traces"):
+                best_query = (
+                    diagnosis["best_traces"][0].get("query", "") or ""
+                )[:12]
+            triggers = [t for t in list(ok_tools)[:2]]
+            if best_query:
+                triggers.insert(0, best_query)
             plans.append(OperatorPlan(
                 operator="skill_evolve",
                 rationale=(
                     f"工具错误率 {stats['tool_error_ratio']} 偏高，"
                     f"固化已验证的成功工具序列 {seq}"
                 ),
-                sop_title="SOP: 高错误率场景标准处置流程",
+                sop_title=f"SOP: {best_query or '高错误率场景'}标准处置",
                 sop_content=(
                     "遇到同类问题时按以下已验证顺序操作：\n"
                     + "\n".join(
@@ -199,7 +209,7 @@ class Improver:
                     )
                     + f"\n避开高频出错工具：{', '.join(error_tools)}"
                 ),
-                sop_triggers=list(ok_tools)[:3],
+                sop_triggers=triggers,
             ))
 
         # 2) token 成本高 → 收紧检索预算

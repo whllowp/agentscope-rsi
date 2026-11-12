@@ -15,6 +15,7 @@ from agentscope.model import ChatModelBase
 
 from ..config import RSIMemConfig
 from ..storage import MemoryRecord
+from ..telemetry import LangfuseBridge, NOOP_BRIDGE
 from .tiers import TierManager
 
 _EXTRACT_SYSTEM = (
@@ -54,9 +55,16 @@ def _first_text(resp: Any) -> str:
 class TurnExtractor:
     """回合增量的记忆提取。"""
 
-    def __init__(self, config: RSIMemConfig, tiers: TierManager) -> None:
+    def __init__(
+        self,
+        config: RSIMemConfig,
+        tiers: TierManager,
+        *,
+        langfuse: LangfuseBridge | None = None,
+    ) -> None:
         self._config = config
         self._tiers = tiers
+        self._langfuse = langfuse or NOOP_BRIDGE
 
     async def extract_turn(
         self,
@@ -97,21 +105,22 @@ class TurnExtractor:
         if model is None:
             return self._rule_fallback(convo)
         try:
-            resp = await model(
-                messages=[
-                    Msg(
-                        name="system",
-                        role="system",
-                        content=[TextBlock(type="text",
-                                           text=_EXTRACT_SYSTEM)],
-                    ),
-                    Msg(
-                        name="user",
-                        role="user",
-                        content=[TextBlock(type="text", text=convo)],
-                    ),
-                ],
-            )
+            with self._langfuse.observe("memory_extract"):
+                resp = await model(
+                    messages=[
+                        Msg(
+                            name="system",
+                            role="system",
+                            content=[TextBlock(type="text",
+                                               text=_EXTRACT_SYSTEM)],
+                        ),
+                        Msg(
+                            name="user",
+                            role="user",
+                            content=[TextBlock(type="text", text=convo)],
+                        ),
+                    ],
+                )
             parsed = json_repair.loads(_first_text(resp))
             if isinstance(parsed, list):
                 return [c for c in parsed if isinstance(c, dict)]

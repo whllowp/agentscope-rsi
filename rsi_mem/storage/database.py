@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from typing import Any, Iterable, Sequence
 
 from agentscope._logging import logger
@@ -88,6 +89,16 @@ CREATE TABLE IF NOT EXISTS pending_reviews (
 CREATE TABLE IF NOT EXISTS vectors (
     memory_id TEXT PRIMARY KEY,
     vec TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS predictions (
+    id TEXT PRIMARY KEY,
+    operator TEXT NOT NULL,
+    genome_version INTEGER,
+    features TEXT NOT NULL DEFAULT '{}',
+    predicted TEXT NOT NULL DEFAULT '{}',
+    realized TEXT,
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -683,6 +694,87 @@ class RSIMemDatabase:
         self, review_id: str, by: str, now: float,
     ) -> None:
         await self._run(self._resolve_review, review_id, by, now)
+
+    # ------------------------------------------------------------------
+    # 预测（RSI-Anything 世界模型类比）
+    # ------------------------------------------------------------------
+    def _insert_prediction(
+        self,
+        operator: str,
+        genome_version: int | None,
+        features: dict,
+        predicted: dict,
+    ) -> str:
+        import shortuuid
+
+        pid = shortuuid.uuid()
+        self._conn.execute(
+            "INSERT INTO predictions (id, operator, genome_version,"
+            " features, predicted, realized, created_at)"
+            " VALUES (?,?,?,?,?,NULL,?)",
+            (
+                pid, operator, genome_version,
+                json.dumps(features, ensure_ascii=False),
+                json.dumps(predicted, ensure_ascii=False),
+                time.time(),
+            ),
+        )
+        return pid
+
+    async def insert_prediction(
+        self,
+        *,
+        operator: str,
+        genome_version: int | None,
+        features: dict,
+        predicted: dict,
+    ) -> str:
+        return await self._run(
+            self._insert_prediction,
+            operator, genome_version, features, predicted,
+        )
+
+    def _update_prediction_realized(
+        self, prediction_id: str, realized: dict,
+    ) -> None:
+        self._conn.execute(
+            "UPDATE predictions SET realized=? WHERE id=?",
+            (json.dumps(realized, ensure_ascii=False), prediction_id),
+        )
+
+    async def update_prediction_realized(
+        self, prediction_id: str, realized: dict,
+    ) -> None:
+        await self._run(
+            self._update_prediction_realized, prediction_id, realized,
+        )
+
+    def _load_predictions(
+        self, realized_only: bool,
+    ) -> list[dict]:
+        sql = "SELECT * FROM predictions"
+        if realized_only:
+            sql += " WHERE realized IS NOT NULL"
+        sql += " ORDER BY created_at DESC LIMIT 500"
+        rows = self._conn.execute(sql).fetchall()
+        out = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "operator": r["operator"],
+                "genome_version": r["genome_version"],
+                "features": json.loads(r["features"]),
+                "predicted": json.loads(r["predicted"]),
+                "realized": (
+                    json.loads(r["realized"]) if r["realized"] else None
+                ),
+            })
+        return out
+
+    async def load_predictions(
+        self, realized_only: bool = False,
+    ) -> list[dict]:
+        return await self._run(self._load_predictions, realized_only)
 
     # ------------------------------------------------------------------
     # meta kv

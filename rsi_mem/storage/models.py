@@ -214,8 +214,8 @@ class GenomeSpec(BaseModel):
     retrieval: RetrievalParams = Field(default_factory=RetrievalParams)
     active_sops: list[str] = Field(default_factory=list)
     """激活的肌肉记忆条目 id（优先级顺序）。"""
-    scores: dict[str, float] = Field(default_factory=dict)
-    """部署时记录的各子问题 Tchebycheff 分数。"""
+    scores: dict[str, Any] = Field(default_factory=dict)
+    """部署时记录的各子问题 Tchebycheff 分数与三目标向量。"""
 
     @classmethod
     def seed(cls) -> GenomeSpec:
