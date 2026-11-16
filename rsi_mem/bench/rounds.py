@@ -13,8 +13,9 @@
    样本数）、保守模式状态、部署版本。
 
 产物：逐轮 rows + summary，写 ``<data_dir>/logs/bench_report.json``。
-断言式结论（见 ``bench_test.py``）：10 轮全部完成、末轮环境质量不低于
-首轮（容差 0.02）、预测样本随轮次积累。
+断言式结论（见 ``rsi_mem/tests/rsi_anything_test.py`` 的
+``test_bench_ten_rounds_non_degrading``）：10 轮全部完成、末轮环境质量
+不低于首轮（容差 0.02）、预测样本随轮次积累。
 """
 from __future__ import annotations
 

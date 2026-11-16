@@ -52,6 +52,24 @@ class ReviewConfig(BaseModel):
     """置信度不低于该值且非安全敏感的提议可自动执行。"""
     min_turns_for_sop: int = Field(default=3, ge=1)
     """同一模式至少出现几次工具轨迹才提议 SOP。"""
+    l3_unverified_max_reviews: int = Field(default=3, ge=1)
+    """L3 驻留上限：unverified 且零命中的 L3 连续 N 次审查后提议
+    ``demote_l3`` 降级（L3_core → L1_atom，退出每轮注入面）。"""
+    verify_refresh_reviews: int = Field(default=10, ge=1)
+    """漂移再验证：trace_verified 条目连续 N 次审查无新命中（hit_count
+    未增加）则重置为 unverified，要求重新挣得验证。"""
+    maintenance_budget: int = Field(default=12, ge=1)
+    """单次审查「维护+污染类」提议合计上限（四插槽：轨迹校验 / 去重 /
+    断链修复 / 注入瘦身 + 既有维护与 L0 回收）。预算口径：晋升插槽
+    维持 ``out[:5]``、SOP 蒸馏单条，均**不计数**。"""
+    long_soft_cap: int = Field(default=500, ge=10)
+    """长期层软上限（软信号，非写入墙）：超限时去重相似阈值 0.85→0.75
+    放宽，且去重/瘦身插槽在维护预算内提到队首（瘦身优先级提升）。"""
+    l3_char_budget: int = Field(default=1200, ge=200)
+    """L3 注入段合计字符预算（合计口径 = L3 段 + U4 索引段；实现预留
+    ``_L3_INDEX_MARGIN``=400 索引余量）。超限按
+    (trace_verified, hit_count, dream_priority) 排序保留头部，其余
+    ``demote_l3``。"""
 
 
 class RSIConfig(BaseModel):
@@ -103,6 +121,22 @@ class ProxyConfig(BaseModel):
     """把检索到的记忆拼进 system 消息（False 则不注入，仅记录轨迹）。"""
 
 
+class WikiConfig(BaseModel):
+    """Wiki 索引化镜像与顶部小索引参数（U4）。
+
+    索引经同一渲染器（mirror.render_index_block）服务两条注入路径
+    （中间件 system_prompt_block / 代理 compact_context_block）与
+    ``INDEX.md`` 写盘。
+    """
+
+    enabled: bool = True
+    index_max_lines: int = Field(default=60, ge=10, le=200)
+    """索引行数上限（头行计入；尾行「更多用 memory_search 检索」提示
+    不计入行数/字节预算、永远保留）。"""
+    index_max_bytes: int = Field(default=8192, ge=1024)
+    """索引字节上限（UTF-8；尾行提示不计入）。"""
+
+
 class RSIMemConfig(BaseModel):
     """顶层配置。"""
 
@@ -118,6 +152,7 @@ class RSIMemConfig(BaseModel):
     review: ReviewConfig = Field(default_factory=ReviewConfig)
     rsi: RSIConfig = Field(default_factory=RSIConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
+    wiki: WikiConfig = Field(default_factory=WikiConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     backend_model: ChatModelBase | None = None
     """记忆提取 / RSI 评审等后台任务专用模型；``None`` 时复用 Agent
@@ -154,6 +189,7 @@ class RSIMemConfig(BaseModel):
             "muscle": self.muscle.model_dump(),
             "review": self.review.model_dump(),
             "rsi": self.rsi.model_dump(),
+            "wiki": self.wiki.model_dump(),
             "telemetry": self.telemetry.model_dump(),
             "has_backend_model": self.backend_model is not None,
             "has_embedding_model": self.embedding_model is not None,

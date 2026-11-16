@@ -36,6 +36,17 @@ LinkKind = Literal["related", "provenance", "promotes"]
 """记忆间链接类型：``related`` 短期→长期相关索引；``provenance``
 新条目指向其证据来源；``promotes`` 晋升后指向晋升前条目。"""
 
+SalienceKind = Literal[
+    "strategy", "plan", "tested_rule", "env_fact", "state", "preference",
+]
+"""显著性种类：策略 / 计划 / 已验证规则 / 环境事实 / 状态 / 偏好。"""
+
+SalienceOutcome = Literal["hit", "promoted", "expired", "ignored"]
+"""「记忆即预测」的结局：命中（真实使用）/ 晋升 / 过期未用 / 被忽略。"""
+
+VerificationLiteral = Literal["unverified", "trace_verified", "refuted"]
+"""注入层验证分级（U2 污染防御）：未验证 / 轨迹验证 / 已证伪。"""
+
 
 def _now() -> float:
     return time.time()
@@ -51,6 +62,50 @@ class MemoryLink(BaseModel):
     target_id: str
     kind: LinkKind = "related"
     note: str = ""
+
+
+class SalienceTag(BaseModel):
+    """「记忆即预测」：写入时的显著性标注与使用预测。
+
+    每条记忆落库前标注「我预测它将来会被这样使用」；之后只在
+    **真实使用点**（reasoning 注入 / 系统提示注入 / agent 主动
+    ``memory_search`` / 晋升）回填 ``settled`` 与 ``settled_outcome``，
+    内部检索（建链 / 回放 / 合成）不回填。过期未用的结局经遥测事件
+    （``salience_expired``）落档而非写库（行将被删）。
+
+    存放于 ``MemoryRecord.source["salience"]``（JSON 列，零 schema
+    变更）；读取侧 (:func:`rsi_mem.memory.salience.tag_of`) 对脏数据
+    容忍 —— 非 dict 或字段类型错返回 ``None``，绝不抛异常。
+    """
+
+    kind: SalienceKind = "state"
+    """显著性种类（默认 ``state``：随会话演化的普通状态）。"""
+    volatile: bool = False
+    """易变状态：每轮可重读、不值得固化（dream 优先级显著降权）。"""
+    rationale: str = ""
+    """为何值得记（一句话，LLM 提取时给出）。"""
+    predicted_use: str = ""
+    """预测的未来使用场景描述（「记忆即预测」的预测面）。"""
+    predicted_value: float = 0.5
+    """预测会被使用的价值估计（0..1）。"""
+    settled: bool = False
+    """预测是否已结算（真实使用点回填；幂等，结算后不再覆盖）。"""
+    settled_outcome: SalienceOutcome | None = None
+
+
+class VerificationState(BaseModel):
+    """注入层验证分级（U2 记忆污染防御）。
+
+    存 ``MemoryRecord.source["verification"]``（JSON 列，零 schema 变更）。
+    ``trace_verified`` 只授予 LLM 复核通过或「被后续成功轨迹注入使用」的
+    记忆；``refuted`` 由隔离（quarantine）执行写入。读取侧
+    (:func:`rsi_mem.memory.guards.verification_of`) 对脏数据容忍。
+    """
+
+    state: VerificationLiteral = "unverified"
+    evidence: list[str] = Field(default_factory=list)
+    """验证/证伪证据轨迹（trace:<id> / llm_recheck:<id> / 原因描述）。"""
+    checked_at: float = 0.0
 
 
 class MemoryRecord(BaseModel):
@@ -261,6 +316,10 @@ ReviewAction = Literal[
     "archive_memory",
     "demote_muscle",
     "merge_memories",
+    "quarantine_memory",
+    "flag_contradiction",
+    "demote_l3",
+    "repair_links",
 ]
 
 

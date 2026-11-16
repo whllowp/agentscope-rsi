@@ -54,11 +54,13 @@ async def test_middleware_pipeline_e2e(setup):
     agent, ctx, mem_mw, rsi_mw, model = setup
     session = agent.state.session_id
 
-    # 预置：长期 L3 + 肌肉 SOP
+    # 预置：长期 L3 + 肌肉 SOP（L3 带用户手写 origin：l3_eligible 上线
+    # 后 unverified 且无 origin 的 L3 不再注入核心档案）
     await ctx.tiers.longterm.add(
         title="环境档案",
         content="生产集群 prod-1，k8s 1.31。",
         layer="L3_core",
+        source={"origin": "memory_note"},
     )
     await ctx.tiers.muscle.note(
         title="磁盘告警SOP",
@@ -141,6 +143,43 @@ async def test_periodic_review_and_tools(setup):
     history = next(t for t in rsi_tools if t.name == "rsi_history")
     chunk = await history()
     assert "v0" in chunk.content[0].text
+
+
+async def test_system_prompt_injection_reaches_trace_and_verifies(setup):
+    """复核修复 1：系统提示注入面（L3）进入轨迹 used_memory_ids。
+
+    此前 system_prompt_block 只返回 str，L3/索引/反射的注入 id 无法
+    进入 used_memory_ids —— 使用型 trace_verified / 负反馈隔离 / 漂移
+    再验证在中间件主路径对这部分注入面全部失效。
+    """
+    agent, ctx, mem_mw, rsi_mw, model = setup
+    session = agent.state.session_id
+    l3 = await ctx.tiers.longterm.add(
+        title="环境档案甲", content="生产集群 prod-9 概要。", layer="L3_core",
+        source={"origin": "memory_note"},
+    )
+
+    # 先组装一次系统提示（真实 reply 内部亦会调用；此处保证确定性）
+    prompt = await mem_mw.on_system_prompt(agent, "基础提示词")
+    assert "环境档案甲" in prompt
+
+    await _say(agent, "看下环境概要")
+    await _drain_background()
+    traces = await ctx.db.list_traces(limit=5)
+    assert traces
+    assert any(
+        l3.id in t.used_memory_ids for t in traces
+    ), "系统提示注入面应进入 used_memory_ids"
+
+    # 使用型验证经中间件主路径可达（score≥0.7 的成功轨迹注入使用）
+    await ctx.consolidator.review_session(
+        session, await ctx.db.list_traces(limit=10),
+    )
+    from rsi_mem.memory.guards import verification_of
+
+    assert verification_of(
+        await ctx.db.get_memory(l3.id),
+    ).state == "trace_verified"
 
 
 async def test_trace_records_tool_calls_via_on_acting(setup):

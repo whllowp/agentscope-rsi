@@ -98,16 +98,43 @@ class RSIEngine:
         self.last_report: dict[str, Any] | None = None
         # 记忆中间件暂存的本轮注入记忆 id（按会话），轨迹结算时取走
         self._injected: dict[Any, list[str]] = {}
+        # RSI 中间件在轨迹结算后上报的 trace id（按会话），记忆写回取走
+        self._last_trace: dict[Any, str] = {}
 
     # ------------------------------------------------------------------
     def note_injected(self, session: Any, memory_ids: list[str]) -> None:
-        """记忆中间件记录某会话本轮注入的记忆 id。"""
-        if memory_ids:
-            self._injected[session] = memory_ids
+        """记忆中间件记录某会话本轮注入的记忆 id（多注入面累积）。
+
+        系统提示面（L3/索引/反射）与 reasoning hint 面在同一次 reply
+        里都会调用 —— 累积合并（保序去重），轨迹结算时一次性取走。
+        """
+        if not memory_ids:
+            return
+        current = self._injected.setdefault(session, [])
+        for mid in memory_ids:
+            if mid not in current:
+                current.append(mid)
 
     def pop_injected(self, session: Any) -> list[str]:
         """RSI 中间件取走该会话暂存的注入 id（供轨迹回归检查）。"""
         return self._injected.pop(session, [])
+
+    def note_trace_finished(
+        self, session: Any, trace_id: str | None,
+    ) -> None:
+        """RSI 中间件在轨迹结算（finish 落库）后上报 trace id。
+
+        记忆中间件回合结束后经 :meth:`last_trace_id` 取走，补传给
+        提取器写 ``source.trace_id``（此前恒为 None）。洋葱序保证 RSI
+        （内层）的 finally 先于 OpsMemory（外层）执行；单挂 OpsMemory
+        时取到 None，安全降级。
+        """
+        if trace_id:
+            self._last_trace[session] = trace_id
+
+    def last_trace_id(self, session: Any) -> str | None:
+        """取走该会话最近一条已结算轨迹 id（pop 语义）。"""
+        return self._last_trace.pop(session, None)
 
     # ------------------------------------------------------------------
     # 在线侧入口

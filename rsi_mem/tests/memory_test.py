@@ -188,10 +188,19 @@ async def test_extractor_rule_fallback(ctx):
     ]
     extractor = TurnExtractor(ctx.config, ctx.tiers)
     records = await extractor.extract_turn(
-        increment, session_id="sx", model=None,
+        increment, session_id="sx", model=None, trace_id="tid-l0",
     )
     assert records, "规则兜底也应产出短期记忆"
     assert any("磁盘" in (r.title + r.content) for r in records)
+
+    # 复核修复 2：提取同时写 L0 原始证据（L0 层的生产写入路径，
+    # U3 L0 回收插槽的输入面）
+    l0s = await ctx.db.list_memories(
+        tier="long", layer="L0_raw", limit=10,
+    )
+    assert l0s, "应写入 L0 原始证据"
+    assert l0s[0].source.get("origin") == "turn_extract"
+    assert l0s[0].source.get("trace_id") == "tid-l0"
 
 
 async def test_summarize_feedback(ctx):

@@ -16,6 +16,7 @@ from agentscope.embedding import EmbeddingModelBase
 
 from ..config import RSIMemConfig
 from ..storage import MemoryRecord, RSIMemDatabase
+from .guards import is_injectable, l3_eligible
 
 RetrievalVia = Literal["bm25", "vector", "link", "l3", "reflex"]
 
@@ -144,6 +145,8 @@ class Retriever:
             rec = await self._db.get_memory(mid)
             if rec is None or rec.status not in ("active", "promoted"):
                 continue
+            if not is_injectable(rec):  # 双保险：refuted 不得注入
+                continue
             if (
                 rec.tier == "short"
                 and rec.session_id
@@ -175,6 +178,7 @@ class Retriever:
                     if (
                         target is None
                         or target.status not in ("active", "promoted")
+                        or not is_injectable(target)
                         or target.tier not in tiers
                     ):
                         continue
@@ -197,10 +201,20 @@ class Retriever:
         return results
 
     async def core_profile(self) -> list[MemoryRecord]:
-        """长期记忆 L3 核心档案（小容量、每轮注入）。"""
-        return await self._db.list_memories(
-            tier="long", layer="L3_core", status="active,promoted", limit=10,
+        """长期记忆 L3 核心档案（小容量、每轮注入）。
+
+        L3 准入走 :func:`l3_eligible`（trace_verified / 用户手写，
+        不依赖 confidence）：超取 30 → 过滤 → 截断回 10。注入即命中：
+        计 hit_count —— 手写 L3 靠注入命中自证存留（驻留计数清零），
+        否则 hit_count 恒 0 会被驻留上限反复提议降级。
+        """
+        cores = await self._db.list_memories(
+            tier="long", layer="L3_core", status="active,promoted", limit=30,
         )
+        eligible = [c for c in cores if l3_eligible(c)][:10]
+        if eligible:
+            await self._db.touch_hits([c.id for c in eligible])
+        return eligible
 
     @staticmethod
     def render_results(results: list[RetrievedMemory]) -> str:

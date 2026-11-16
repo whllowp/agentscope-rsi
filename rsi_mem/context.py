@@ -42,7 +42,7 @@ class RSIMemContext:
             if self.config.telemetry.langfuse else NOOP_BRIDGE
         )
         self.tiers = TierManager(
-            self.db, self.mirror, self.config,
+            self.db, self.mirror, self.config, events=self.events,
         )
         self.extractor = TurnExtractor(
             self.config, self.tiers, langfuse=self.langfuse,

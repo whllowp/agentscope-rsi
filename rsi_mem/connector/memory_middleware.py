@@ -131,8 +131,11 @@ class OpsMemoryMiddleware(MiddlewareBase):
                 and getattr(m, "name", None) != _MEMORY_MSG_NAME
             ]
             model = self._agent_model(agent)
+            # RSI（内层）finally 已先执行并上报 trace id；此刻同步取走
+            # （pop 语义），单挂 OpsMemory 时为 None → 提取器安全降级
+            trace_id = self.ctx.engine.last_trace_id(session)
             asyncio.create_task(self._turn_postwork(
-                increment, session, model,
+                increment, session, model, trace_id,
             ))
 
     async def _retrieve_hint(self, query: str, session) -> tuple[str, list[str]]:
@@ -155,6 +158,7 @@ class OpsMemoryMiddleware(MiddlewareBase):
         increment: list[Msg],
         session,
         model: ChatModelBase | None,
+        trace_id: str | None = None,
     ) -> None:
         """回合后处理：提取短期记忆；每 N 轮触发固化审查。"""
         try:
@@ -165,6 +169,7 @@ class OpsMemoryMiddleware(MiddlewareBase):
             if has_exchange:
                 await self.ctx.extractor.extract_turn(
                     increment, session_id=session, model=model,
+                    trace_id=trace_id,
                 )
             turns = self._turn_counts.get(session, 0) + 1
             self._turn_counts[session] = turns
@@ -217,13 +222,19 @@ class OpsMemoryMiddleware(MiddlewareBase):
         query = self._current_query.get(session, "")
         try:
             genome = await self.ctx.db.active_genome()
-            block = await self.ctx.tiers.system_prompt_block(
-                query=query or (current_prompt[:200]),
-                genome=genome,
+            block, injected_ids = (
+                await self.ctx.tiers.system_prompt_block_with_ids(
+                    query=query or (current_prompt[:200]),
+                    genome=genome,
+                )
             )
         except Exception as e:  # noqa: BLE001
             logger.warning("system prompt memory block failed: %s", e)
-            block = ""
+            block, injected_ids = "", []
+        # U2 信号接缝（主路径）：系统提示注入面（L3/索引/反射）计入
+        # 本轮轨迹 used_memory_ids —— 使用型验证 / 负反馈隔离 / 漂移
+        # 再验证的信号源；note_injected 累积语义，与 reasoning hint 合并
+        self.ctx.engine.note_injected(session, injected_ids)
         parts = [current_prompt]
         if block:
             parts.append(block)

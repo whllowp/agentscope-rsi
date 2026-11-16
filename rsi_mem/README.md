@@ -49,7 +49,7 @@ python -m rsi_mem.demo.main --backend dashscope --model qwen3.7-max
 export OPENAI_API_KEY=... OPENAI_BASE_URL=https://.../v1
 python -m rsi_mem.demo.main --backend openai --model gpt-4o
 
-# 测试（34 个，全部离线）
+# 测试（94 个，全部离线）
 python -m pytest rsi_mem/tests -q
 ```
 
@@ -126,6 +126,25 @@ app = create_app(..., extra_agent_middlewares=build_middleware_factory())
 - **检索**：FTS5 trigram bm25（中文友好）+ 可选向量（配置
   `embedding_model`）+ RRF 融合 + 阈值/条数/字符预算，参数由基因组控制。
 
+## 记忆组件设计（本轮优化：对应 Anthropic 记忆组件）
+
+在三层骨架之上，本轮按 Anthropic agent 记忆组件框架补齐五组机制
+（详细设计与数据流见 [docs/memory-components-design.md](docs/memory-components-design.md)）：
+
+| Anthropic 组件 | 本实现 | 主要接缝 |
+|---|---|---|
+| **显著性**（什么值得记） | 写入侧 `SalienceTag` 标注（种类/易变性/预测使用/价值），LLM 提取硬约束 + 规则兜底 volatile，存 `source["salience"]` 零 schema 变更 | `memory/salience.py`、`memory/extract.py` |
+| **记忆即预测**（写入即预测、使用即检验） | 只在真实使用点（系统提示/推理注入/主动检索/晋升）回填 `settled_outcome`，内部检索不回填；过期走 `salience_expired` 遥测不写库 | `memory/tiers.py`（5 个结算挂点） |
+| **Dreaming 固化**（空闲期巩固） | `Consolidator` 周期审查管线：晋升/SOP 蒸馏/轨迹校验/去重/断链修复/瘦身/肌肉降级/L0 回收，维护+污染提议合计 12 条预算 | `memory/consolidate.py`（中间件与代理两条触发链路） |
+| **污染防御**（注入层验证） | `VerificationState` 三级（unverified/trace_verified/refuted）：负反馈先于一切 score 判定、使用型验证 + LLM 复核、漂移再验证、L3 驻留上限、矛盾检测互插旗标；`l3_eligible` 准入**不看 confidence**；refuted 记忆检索双保险拦截 | `memory/guards.py`、`memory/consolidate.py` |
+| **记忆索引（Wiki）** | 长期记忆镜像为主题页 + `INDEX.md`；上下文顶部注入「知道什么、去哪找」小索引（行数/字节双预算），细节按需 `memory_search` | `storage/mirror.py`、`config.py`（`WikiConfig`） |
+| 注入层瘦身（索引化注入的预算面） | L3 段 + 索引段合计 ≤ `l3_char_budget`=1200（共享 `L3_INDEX_MARGIN`=400）；超限按 (trace_verified, hit_count, dream_priority) 排序保留头部，其余降级 L1 并留 related 链接可回捞 | `memory/consolidate.py`、`memory/tiers.py` |
+
+关键不变式：注入 id 经 `note_injected` 落进轨迹 `used_memory_ids`
+（中间件与代理两条链路），是使用型验证、负反馈隔离、驻留/漂移判定
+与预测结算的共同信号源；所有标注读写对脏数据容忍、settle/重建/遥测
+失败只告警不阻断主链路。
+
 ## RSI 设计（论文机制 → 本实现）
 
 | 论文机制 | 实现 |
@@ -160,7 +179,9 @@ SOP 集），不是任意代码——这是"不改动源码"约束下的安全�
 └── mirror/
     ├── muscle/<name>/SKILL.md   # 肌肉记忆镜像（兼容 LocalSkillLoader，
     │                            #  demo 已自动挂为技能目录）
-    └── longterm/<id>.md         # 长期记忆人类可读镜像
+    ├── longterm/<id>.md         # 长期记忆人类可读镜像
+    └── wiki/                    # 长期记忆 wiki（U4）：主题页 + INDEX.md
+                                 #  顶部小索引（周期全量重建，可随时删重建）
 ```
 
 ## Agent 可用的新工具
@@ -186,6 +207,7 @@ RSIMemConfig(
     long_term=dict(mode="both", top_k=5, char_budget=2000),
     muscle=dict(max_reflex_bytes=2048, max_hits=3),
     review=dict(every_n_turns=10, auto_accept_confidence=0.85),
+    wiki=dict(enabled=True, index_max_lines=60, index_max_bytes=8192),
     rsi=dict(enabled=True, dream_every_n_traces=20, candidates=4),
     backend_model=None,             # 后台 LLM（None=复用 Agent 主模型）
     embedding_model=None,           # 可选向量检索
@@ -203,13 +225,17 @@ RSIMemConfig(
 ## 测试
 
 ```bash
-python -m pytest rsi_mem/tests -q   # 47 个用例，全部离线
+python -m pytest rsi_mem/tests -q   # 94 个用例，全部离线
 ```
 
 覆盖：FTS 中文检索、TTL/LRU、链接展开、晋升溯源、分级确认、SOP 蒸馏、
 锁定片段防护、空演化拒绝、悬挂引用修复、回放回归检出、**非退化保障**、
 回滚、中间件 e2e（真实 Agent + 假模型）、HTTP 代理注入与轨迹、mock 模型
-全链路组装，以及本轮新增：**插件注册表（含坏插件容错）**、**预测器
+全链路组装，以及上轮新增：**插件注册表（含坏插件容错）**、**预测器
 先验→校准→可靠性门**、**保守模式拦截高风险计划**、**预测持久化回填**、
 **本地事件日志与 langfuse 桥（含假客户端）**、**诊断证据分级**、
-**10 轮基准非退化断言**、**CLI doctor/report**。
+**10 轮基准非退化断言**、**CLI doctor/report**；本轮记忆组件新增：
+**显著性标注与「只有注入才结算」**、**污染防御（负反馈先于 score、
+l3 准入不看 confidence、矛盾互插旗标）**、**固化管线四插槽（去重/
+断链修复/注入瘦身/L0 回收 + 预算封顶与并发幂等）**、**Wiki 索引
+（归簇/防撞/双预算截断/幂等重建/归档排除）**。

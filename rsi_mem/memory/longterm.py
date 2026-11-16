@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from ..storage import MemoryRecord, MirrorStore, RSIMemDatabase
+from ..storage import MemoryLink, MemoryRecord, MirrorStore, RSIMemDatabase
 from .retrieval import Retriever
 
 
@@ -97,11 +97,19 @@ class LongTermStore:
     async def merge(
         self, primary_id: str, duplicate_id: str,
     ) -> MemoryRecord | None:
-        """合并重复条目：把 duplicate 的要点并入 primary 后归档。"""
+        """合并重复条目：把 duplicate 的要点并入 primary 后归档。
+
+        归档前写 ``source["merged_into"]=primary_id`` 并**即时重定向**
+        指向 duplicate 的 related 链接（U3：merge 的链接语义闭环）；
+        断链修复插槽对漏网链接按 ``merged_into`` 重定向。幂等：已带
+        ``merged_into`` 的 duplicate 直接返回 primary。
+        """
         primary = await self._db.get_memory(primary_id)
         duplicate = await self._db.get_memory(duplicate_id)
         if primary is None or duplicate is None:
             return None
+        if duplicate.source.get("merged_into"):
+            return primary  # 已合并过（幂等）
         if primary.content and duplicate.content not in primary.content:
             primary.content = (
                 f"{primary.content}\n\n[合并自 {duplicate_id[:8]}] "
@@ -110,6 +118,37 @@ class LongTermStore:
         primary.version += 1
         await self._db.update_memory(primary)
         self._mirror.write_longterm(primary)
+        # 归档前留 merged_into（断链修复的重定向锚点）
+        duplicate.source["merged_into"] = primary_id
+        await self._db.update_memory(duplicate)
+        await self._redirect_links(duplicate_id, primary_id)
         dup = await self.archive(duplicate_id)
         assert dup is not None
         return primary
+
+    async def _redirect_links(
+        self, duplicate_id: str, primary_id: str,
+    ) -> None:
+        """把指向 duplicate 的 related 链接即时重定向到 primary。"""
+        hosts = await self._db.list_memories(
+            tier="long,short", status="active,promoted", limit=1000,
+        )
+        for host in hosts:
+            if not any(
+                l.target_id == duplicate_id and l.kind == "related"
+                for l in host.links
+            ):
+                continue
+            kept: list[MemoryLink] = []
+            for link in host.links:
+                if link.target_id == duplicate_id and link.kind == "related":
+                    if not any(x.target_id == primary_id for x in kept):
+                        kept.append(MemoryLink(
+                            target_id=primary_id, kind="related",
+                            note=f"redirect:{duplicate_id[:8]}",
+                        ))
+                    # 已有指向 primary 的链接则直接丢弃重复链
+                else:
+                    kept.append(link)
+            host.links = kept
+            await self._db.update_memory(host)

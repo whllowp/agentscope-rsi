@@ -133,3 +133,37 @@ async def test_stats(db):
     await db.active_genome()  # 落种子基因组
     s = await db.stats()
     assert s["muscle"] == 1 and s["genome_version"] == 0
+    assert s["broken_links"] == 0
+    # 造一条断链（指向不存在的 id）→ 计数
+    m = MemoryRecord(tier="long", layer="L1_atom", title="t", content="c")
+    from rsi_mem.storage import MemoryLink
+
+    m.links.append(MemoryLink(target_id="nope", kind="related"))
+    await db.insert_memory(m)
+    assert (await db.stats())["broken_links"] == 1
+
+
+async def test_list_memories_tier_comma_split(db):
+    """U3 扫描接缝修复的直接断言：tier 支持逗号拆分。
+
+    此前 tier 是精确 AND 匹配（仅 status 拆分），传
+    ``tier="long,short"`` 得空集、link_repair 静默 no-op。
+    """
+    await db.insert_memory(MemoryRecord(
+        tier="long", layer="L1_atom", title="长期条目", content="x",
+    ))
+    await db.insert_memory(MemoryRecord(
+        tier="short", title="短期条目", content="y",
+    ))
+    await db.insert_memory(MemoryRecord(
+        tier="muscle", title="肌肉条目", content="z",
+    ))
+    both = await db.list_memories(
+        tier="long,short", status="active,promoted",
+    )
+    assert {m.tier for m in both} == {"long", "short"}, \
+        "tier 逗号拆分应返回两层记录"
+    assert all(m.tier != "muscle" for m in both)
+    # 单值语义不回归
+    only_long = await db.list_memories(tier="long")
+    assert {m.tier for m in only_long} == {"long"}

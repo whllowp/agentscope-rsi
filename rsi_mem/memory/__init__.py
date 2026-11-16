@@ -3,6 +3,7 @@
 from .longterm import LongTermStore
 from .muscle import MuscleMatcher
 from .retrieval import Retriever, RetrievedMemory
+from .salience import SalienceTag
 from .shortterm import ShortTermStore
 from .tiers import TierManager
 
@@ -11,6 +12,7 @@ __all__ = [
     "MuscleMatcher",
     "Retriever",
     "RetrievedMemory",
+    "SalienceTag",
     "ShortTermStore",
     "TierManager",
 ]

@@ -11,8 +11,14 @@ import time
 from agentscope._logging import logger
 
 from ..config import RSIMemConfig
-from ..storage import MemoryLink, MemoryRecord, RSIMemDatabase
+from ..storage import (
+    MemoryLink,
+    MemoryRecord,
+    RSIMemDatabase,
+    SalienceTag,
+)
 from .retrieval import Retriever
+from .salience import annotate, tag_of
 
 
 class ShortTermStore:
@@ -40,8 +46,16 @@ class ShortTermStore:
         link_query: str | None = None,
         max_links: int = 3,
     ) -> MemoryRecord:
-        """写入一条短期记忆，并自动检索长期记忆建立索引链接。"""
+        """写入一条短期记忆，并自动检索长期记忆建立索引链接。
+
+        写入路径带显著性标注（「记忆即预测」）：source 未提供 ``salience``
+        时补一条默认标注（kind=state）；显式传入的标注（含脏数据）原样
+        透传，读取侧 :func:`tag_of` 容忍。
+        """
         now = time.time()
+        merged_source = dict(source or {})
+        if "salience" not in merged_source:
+            merged_source["salience"] = SalienceTag().model_dump()
         record = MemoryRecord(
             tier="short",
             kind=kind,
@@ -50,7 +64,7 @@ class ShortTermStore:
             session_id=session_id,
             confidence=confidence,
             expires_at=now + self._config.short_term.ttl_hours * 3600,
-            source=source or {},
+            source=merged_source,
         )
         # —— 短期 → 长期 索引链接 ——
         if self._retriever is not None:
@@ -126,6 +140,11 @@ class ShortTermStore:
         # 保持 id 不变以维持已有链接；晋升标记放 source
         rec.source = {"promoted_from": "short", "original_id": old_id,
                       **rec.source}
+        # 晋升是真实使用信号：回填 "promoted"（幂等；无标注不结算——
+        # 不凭空创建 settled 标注，与 is_settled 契约一致）
+        tag = tag_of(rec)
+        if tag is not None and not tag.settled:
+            annotate(rec, settled=True, settled_outcome="promoted")
         await self._db.update_memory(rec)
         if self._retriever is not None:
             await self._retriever.embed_and_store(rec)

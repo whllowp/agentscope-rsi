@@ -130,6 +130,15 @@ class MemoryNoteTool(_MemoryToolBase):
                                    "long=长期知识，short=短期临时",
                     "default": "long",
                 },
+                "layer": {
+                    "type": "string",
+                    "enum": ["L1_atom", "L2_scenario", "L3_core"],
+                    "description": "tier=long 时的目标层（默认 L1_atom）。"
+                                   "L3_core 为用户手写核心档案：确认后"
+                                   "每轮注入（l3_eligible 白名单凭 "
+                                   "origin=memory_note 准入）。",
+                    "default": "L1_atom",
+                },
                 "triggers": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -145,6 +154,7 @@ class MemoryNoteTool(_MemoryToolBase):
         content: str,
         kind: str = "fact",
         tier: str = "long",
+        layer: str = "L1_atom",
         triggers: list[str] | None = None,
     ) -> ToolChunk:
         if tier == "short":
@@ -177,8 +187,12 @@ class MemoryNoteTool(_MemoryToolBase):
                 payload={
                     "title": title,
                     "content": content,
-                    "layer": "L1_atom",
+                    "layer": layer,
                     "kind": kind,
+                    # 用户手写来源：这是 L3_core 的生产创建路径 ——
+                    # 确认后的 L3 即用户手写核心档案，凭 origin 走
+                    # guards.l3_eligible 白名单准入（不依赖 confidence）
+                    "source": {"origin": "memory_note"},
                 },
                 reason=f"提议长期记忆：{title[:40]}",
                 confidence=0.75,

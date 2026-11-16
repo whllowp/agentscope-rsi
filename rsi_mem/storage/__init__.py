@@ -12,8 +12,10 @@ from .models import (
     PermissionEvent,
     PromptFragment,
     RetrievalParams,
+    SalienceTag,
     ToolCallNode,
     TraceRecord,
+    VerificationState,
 )
 
 __all__ = [
@@ -28,6 +30,8 @@ __all__ = [
     "PermissionEvent",
     "PromptFragment",
     "RetrievalParams",
+    "SalienceTag",
     "ToolCallNode",
     "TraceRecord",
+    "VerificationState",
 ]

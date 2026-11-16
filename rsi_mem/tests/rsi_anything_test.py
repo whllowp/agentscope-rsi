@@ -169,7 +169,7 @@ async def test_predictions_persisted_with_realized(ctx):
     assert preds, "dream 应写入预测记录"
     realized = [p for p in preds if p["realized"] is not None]
     assert realized, "回放结果应回填为观测"
-    assert report_has_prediction(ctx)
+    assert await report_has_prediction(ctx)
 
 
 async def report_has_prediction(ctx) -> bool:

@@ -331,8 +331,11 @@ class RSIMemDatabase:
         sql = "SELECT * FROM memories WHERE 1=1"
         params: list[Any] = []
         if tier is not None:
-            sql += " AND tier=?"
-            params.append(tier)
+            # tier 支持逗号拆分（对齐 status 的既有实现）——跨层扫描
+            # （如断链修复的 tier="long,short"）依赖此语义
+            tiers = [t.strip() for t in tier.split(",") if t.strip()]
+            sql += " AND tier IN (%s)" % ",".join("?" * len(tiers))
+            params.extend(tiers)
         if status is not None:
             states = [s.strip() for s in status.split(",") if s.strip()]
             sql += " AND status IN (%s)" % ",".join("?" * len(states))
@@ -387,6 +390,18 @@ class RSIMemDatabase:
     async def expire_short_term(self, now: float) -> int:
         """清理过期短期记忆，返回删除条数。"""
         return await self._run(self._expire_short, now)
+
+    def _expired_short_ids(self, now: float) -> list[str]:
+        rows = self._conn.execute(
+            "SELECT id FROM memories WHERE tier='short' AND expires_at"
+            " IS NOT NULL AND expires_at < ?",
+            (now,),
+        ).fetchall()
+        return [r["id"] for r in rows]
+
+    async def expired_short_ids(self, now: float) -> list[str]:
+        """列出已过期短期记忆 id（只 SELECT 不删，供过期遥测先落档）。"""
+        return await self._run(self._expired_short_ids, now)
 
     def _touch_hits(self, memory_ids: Sequence[str]) -> None:
         for mid in memory_ids:
@@ -824,6 +839,27 @@ class RSIMemDatabase:
             out["genome_version"] = (
                 int(row["v"]) if row and row["v"] is not None else -1
             )
+            # —— 断链计数（U3）：target 缺失 / status 失效 / 短期已过期 ——
+            rows = self._conn.execute(
+                "SELECT id, tier, status, expires_at, links FROM memories",
+            ).fetchall()
+            by_id = {r["id"]: r for r in rows}
+            now = time.time()
+            broken = 0
+            for r in rows:
+                for link in json.loads(r["links"]):
+                    target = by_id.get(link.get("target_id"))
+                    if (
+                        target is None
+                        or target["status"] not in ("active", "promoted")
+                        or (
+                            target["tier"] == "short"
+                            and target["expires_at"] is not None
+                            and target["expires_at"] < now
+                        )
+                    ):
+                        broken += 1
+            out["broken_links"] = broken
             return out
 
         return await self._run(_stats)

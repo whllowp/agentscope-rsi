@@ -105,6 +105,11 @@ class RSIMiddleware(MiddlewareBase):
                         session,
                     ),
                 )
+                # 上报本轮轨迹 id：记忆中间件（外层 finally 稍后执行）
+                # 经 last_trace_id 取走补传给提取器写 source.trace_id
+                self.ctx.engine.note_trace_finished(
+                    session, recorder.record.id,
+                )
                 if self.ctx.config.rsi.enabled:
                     self.ctx.engine.on_trace_finished()
             except Exception as e:  # noqa: BLE001
