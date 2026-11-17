@@ -49,7 +49,7 @@ python -m rsi_mem.demo.main --backend dashscope --model qwen3.7-max
 export OPENAI_API_KEY=... OPENAI_BASE_URL=https://.../v1
 python -m rsi_mem.demo.main --backend openai --model gpt-4o
 
-# 测试（94 个，全部离线）
+# 测试（124 个，全部离线）
 python -m pytest rsi_mem/tests -q
 ```
 
@@ -147,20 +147,28 @@ app = create_app(..., extra_agent_middlewares=build_middleware_factory())
 
 ## RSI 设计（论文机制 → 本实现）
 
+v3 引擎深化（MOEA/D 邻域替换与平衡部署、不确定性惩罚选择、ρ 扫描
+Pareto 评分、前缀盲评防泄漏、债务清偿）的逐机制数学定义与接缝文件见
+[docs/rsi-engine-v3-design.md](docs/rsi-engine-v3-design.md)。
+
 | 论文机制 | 实现 |
 |---|---|
-| Dream-RSI：发现树在线录制 | `RSIMiddleware` 把每轮 reply 录成 `TraceRecord`（工具调用/模型成本/权限/结局评分/注入过的记忆 id） |
+| Dream-RSI：发现树在线录制 | `RSIMiddleware` 把每轮 reply 录成 `TraceRecord`（工具调用含 `step_index`/`(n,k*)` 信号/模型成本/权限/结局评分/注入过的记忆 id） |
 | Dream-RSI：历史 = 回放模拟器 | `rsi/replay.py` 在录制轨迹上做反事实评估：检索重放（确定性）、成本重估（注入字符差→token 差）、**回归检查**（成功轨迹用过的记忆，候选参数下必须仍召回） |
-| Dream-RSI：候选恒含 v0、argmax 选择 → 非退化 | `RSIEngine.dream` 候选集始终含当前基因组，同一评分函数下 Tchebycheff 距离最小者获胜 ⇒ **选中者永不差于现状**（有单测断言该性质） |
-| Harmony：MOEA/D 多目标 + Tchebycheff | `rsi/objectives.py`：质量（结局评分×回归覆盖+LLM评审增量）/ 成本效率 / 安全（权限拒绝率×校验）；多权重子问题（默认质量优先/成本优先） |
+| Dream-RSI：候选恒含 v0 → 非退化 | `RSIEngine.dream` 候选集始终含当前基因组（v0 的预测不确定性 u≡0），部署经 λ₀ 质量门 G={c: t′(c,λ₀)≤t′(v0,λ₀)}，门内最平衡者获胜（tie-break 链末级偏 v0）⇒ **选中者永不差于现状**（有单测断言该性质） |
+| Harmony：MOEA/D 多目标 + Tchebycheff | `rsi/objectives.py`：质量（结局评分×回归覆盖+LLM评审增量）/ 成本效率 / 安全（权限拒绝率×校验）；多权重子问题（默认质量优先 λ₀/成本优先 λ₁） |
+| Harmony：MOEA/D 邻域替换与 per-λ incumbent | 每个 λ 维护独立 incumbent（跨轮持久化于 meta，恢复即重验、失败回退 v0）；改进即换人（降序贪心 + 惰性重验），单候选替换数 `replace_cap` 封顶（nr）；部署 = 质量门内 **H†=argmax min(quality′,cost,safety)** 最平衡选择 |
 | Harmony：diagnose→hypothesize→operator | `rsi/improver.py` 诊断聚合（错误工具 Top、最好/最差轨迹）→ LLM 假设或规则兜底 → `operators.py` 四算子：`skill_evolve` / `logic_evolve` / `retrieval_evolve` / `generalize` |
 | Harmony：证据完整性门 | 诊断引用的轨迹 id 全部对库校验，伪造引用直接丢弃 |
 | Harmony：三段校验 + 一次修复 + 回滚 | `rsi/validator.py`：结构段（schema/上限）→ 冒烟段（SOP 引用存在、序列化往返）→ 完整性段（**锁定安全片段逐字保留**、拒绝空演化）；`rsi_evolve(rollback=True)` 一键回滚 |
 | Harmony：gen/env 作用域 | `generalize` 算子做会话 SOP → 全局反射晋升；记忆条目带 `scope` 字段 |
-| **RSI-Anything：世界模型** | `rsi/predictor.py` 候选执行**前**预测三目标增量（特征=候选 vs 父代结构差）；预测-观测对写 `predictions` 表并按算子在线校准（MAE/不确定性随样本下降） |
+| RSI-Anything：世界模型 | `rsi/predictor.py` 候选执行**前**预测三目标增量（特征=候选 vs 父代结构差）；预测-观测对写 `predictions` 表并按算子在线校准（MAE/不确定性随样本下降） |
+| RSI-Anything：不确定性惩罚选择（Eq.7） | 统一子问题度量 **t′ = tchebycheff + λu·u**（距离域转写；u=预测不确定性，有样本 1/(1+n)、零样本先验 0.8；v0 与已验证条目 u≡0 不惩罚）；λu=`uncertainty_lambda` 默认 0 关闭；λ₀ 质量门、邻域替换、报告分数三处同一本账 |
 | **RSI-Anything：保留门** | ① 可靠性门：预测样本足够且 MAE 超阈 → 保守模式（仅放行 `retrieval_evolve` 小步候选）直至重新校准；② pair gate：胜者部署前再做一次组装态终校验 |
 | **RSI-Anything：E0-E3 分级证据** | `rsi/evidence.py` —— E0 规则检查 / E1 模型预测 / E2 模拟回放 / E3 真实测量，诊断与 dream 报告逐信号标注（doctor 按证据强度排序发现） |
 | **RSI-Anything：域适配器插件化** | `rsi/plugins.py` —— 计划生成收敛到 `PluginRegistry`，内置改进器也只是插件；第三方经 `rsi.plugins=["pkg:Plugin"]` 或 entry points `rsi_mem.plugins` 注入，**无法绕过校验与非退化门** |
+| 论文 Eq.1：ρ 扫描 Pareto 评分 | 回放对每条轨迹按 `rho_grid`（默认 5 档）插值 top_k/char_budget，得归一化质量-成本点 (n,a)，非支配过滤后算前沿下面积 `pareto_auc`（−并行度惩罚 λ∥·k\*/n）；经 `pareto_alpha` 混入排序目标 q′=(1−α)·quality+α·AUC（ideal 同空间维护，α=0 回退旧行为） |
+| 论文附录 D.2：prefix-only 防泄漏 | 评审（judge）证据为**前缀视图**：剥离结局分数（`mean_outcome`/`worst·best_traces[].score`），前置前 5 步工具序列与 (n,k\*) 数据；v0 第二轮起同被评审（同视野公平），评审每候选一次不随 ρ 放大；诊断全量数据仍留给策略侧 |
 
 **演化对象是声明式基因组**（`GenomeSpec`：提示词片段 + 检索参数 + 激活
 SOP 集），不是任意代码——这是"不改动源码"约束下的安全演化边界。RSI
@@ -208,7 +216,12 @@ RSIMemConfig(
     muscle=dict(max_reflex_bytes=2048, max_hits=3),
     review=dict(every_n_turns=10, auto_accept_confidence=0.85),
     wiki=dict(enabled=True, index_max_lines=60, index_max_bytes=8192),
-    rsi=dict(enabled=True, dream_every_n_traces=20, candidates=4),
+    rsi=dict(enabled=True, dream_every_n_traces=20, candidates=4,
+             subproblems=[[0.7, 0.2, 0.1], [0.2, 0.7, 0.1]],  # MOEA/D λ
+             replace_cap=2,           # 邻域替换 nr 封顶
+             uncertainty_lambda=0.0,  # t′ = tchebycheff + λu·u（0 关闭）
+             rho_grid=[0.0, 0.25, 0.5, 0.75, 1.0],  # ρ 预算扫描
+             pareto_alpha=0.5),       # q′=(1−α)·quality+α·pareto_auc
     backend_model=None,             # 后台 LLM（None=复用 Agent 主模型）
     embedding_model=None,           # 可选向量检索
 )
@@ -225,7 +238,7 @@ RSIMemConfig(
 ## 测试
 
 ```bash
-python -m pytest rsi_mem/tests -q   # 94 个用例，全部离线
+python -m pytest rsi_mem/tests -q   # 124 个用例，全部离线
 ```
 
 覆盖：FTS 中文检索、TTL/LRU、链接展开、晋升溯源、分级确认、SOP 蒸馏、
@@ -234,8 +247,16 @@ python -m pytest rsi_mem/tests -q   # 94 个用例，全部离线
 全链路组装，以及上轮新增：**插件注册表（含坏插件容错）**、**预测器
 先验→校准→可靠性门**、**保守模式拦截高风险计划**、**预测持久化回填**、
 **本地事件日志与 langfuse 桥（含假客户端）**、**诊断证据分级**、
-**10 轮基准非退化断言**、**CLI doctor/report**；本轮记忆组件新增：
+**10 轮基准非退化断言**、**CLI doctor/report**；记忆组件轮新增：
 **显著性标注与「只有注入才结算」**、**污染防御（负反馈先于 score、
 l3 准入不看 confidence、矛盾互插旗标）**、**固化管线四插槽（去重/
 断链修复/注入瘦身/L0 回收 + 预算封顶与并发幂等）**、**Wiki 索引
-（归簇/防撞/双预算截断/幂等重建/归档排除）**。
+（归簇/防撞/双预算截断/幂等重建/归档排除）**；本轮引擎深化新增：
+**MOEA/D 邻域替换与 per-λ incumbent（λ₁ 激活/nr 封顶/跨轮 SOP 归档
+回归/存档目标值不进门/引擎重启恢复）**、**t′ 不确定性惩罚（λu>0 压
+伪优候选、λu=0 对照照常部署、λu×α 双重压制）**、**ρ 扫描 Pareto
+前沿面积（点集/被支配剔除/缩放不变/全零分池）**、**前缀盲评（结局
+分数剥离、(n,k\*) 前置、评审调用不随 ρ 放大）**、**doctor 子问题覆盖
+与 Pareto 退化哨兵**，以及 U1 债务①-⑥ 清偿（merge 锚点/断链预过滤/
+空拆分语义/后台任务强引用与原子计数/游标扫描与精确查重/注入面截断
+兜底）。

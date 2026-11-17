@@ -327,6 +327,8 @@ class RSIMemDatabase:
         layer: str | None,
         scope: str | None,
         limit: int,
+        updated_before: float | None,
+        cursor_id: str | None,
     ) -> list[MemoryRecord]:
         sql = "SELECT * FROM memories WHERE 1=1"
         params: list[Any] = []
@@ -334,12 +336,23 @@ class RSIMemDatabase:
             # tier 支持逗号拆分（对齐 status 的既有实现）——跨层扫描
             # （如断链修复的 tier="long,short"）依赖此语义
             tiers = [t.strip() for t in tier.split(",") if t.strip()]
-            sql += " AND tier IN (%s)" % ",".join("?" * len(tiers))
-            params.extend(tiers)
+            if not tiers:
+                # 空拆分 → 空集（U1 债务③：语义锁定与防御。当前
+                # SQLite 实测 `IN ()` 也合法返回空集，此处显式 1=0
+                # 不依赖该方言行为，防止误扫全表）
+                sql += " AND 1=0"
+            else:
+                sql += " AND tier IN (%s)" % ",".join("?" * len(tiers))
+                params.extend(tiers)
         if status is not None:
             states = [s.strip() for s in status.split(",") if s.strip()]
-            sql += " AND status IN (%s)" % ",".join("?" * len(states))
-            params.extend(states)
+            if not states:
+                sql += " AND 1=0"  # 同上：空拆分 → 空集
+            else:
+                sql += (
+                    " AND status IN (%s)" % ",".join("?" * len(states))
+                )
+                params.extend(states)
         if session_id is not None:
             sql += " AND session_id=?"
             params.append(session_id)
@@ -349,7 +362,23 @@ class RSIMemDatabase:
         if scope is not None:
             sql += " AND scope=?"
             params.append(scope)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
+        if updated_before is not None:
+            if cursor_id is None:
+                # 维护扫描游标主边界（U1 债务⑤）：<= 而非 <——边界行
+                # 允许重复入窗（判定型扫描幂等），< 会跳行漏扫
+                sql += " AND updated_at <= ?"
+                params.append(updated_before)
+            else:
+                # 复合游标 (updated_at, id)：并列时间戳组大小超过
+                # limit 时，纯时间戳 <= 会永远重复同一窗（本会话
+                # SQLite 3.50.4 实测）→ 组内按 id 走窗，边界行同样
+                # 含（<=）：允许重复一次、绝不跳行
+                sql += (
+                    " AND (updated_at < ?"
+                    " OR (updated_at = ? AND id <= ?))"
+                )
+                params.extend([updated_before, updated_before, cursor_id])
+        sql += " ORDER BY updated_at DESC, id DESC LIMIT ?"
         params.append(limit)
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(r) for r in rows]
@@ -363,11 +392,51 @@ class RSIMemDatabase:
         layer: str | None = None,
         scope: str | None = None,
         limit: int = 200,
+        updated_before: float | None = None,
+        cursor_id: str | None = None,
     ) -> list[MemoryRecord]:
+        """按 ``updated_at DESC, id DESC`` 稳定序查询。
+
+        ``updated_before`` 是维护扫描游标主边界（``<=`` 含边界行）；
+        并给 ``cursor_id`` 时升级为复合游标 ``(updated_at, id)`` ——
+        并列时间戳组超过 limit 时纯时间戳边界会永远重复同一窗，
+        复合边界在组内按 id 走窗：允许重复一次、不跳行（U1 债务⑤）。
+        """
         return await self._run(
             self._list_memories_impl,
             tier, status, session_id, layer, scope, limit,
+            updated_before, cursor_id,
         )
+
+    def _find_by_title(
+        self, tier: str, title: str, status: str,
+    ) -> MemoryRecord | None:
+        """精确标题查询（tier/status 支持逗号拆分，语义同 list）。"""
+        tiers = [t.strip() for t in tier.split(",") if t.strip()]
+        states = [s.strip() for s in status.split(",") if s.strip()]
+        sql = "SELECT * FROM memories WHERE title=?"
+        params: list[Any] = [title]
+        if not tiers:
+            return None  # 空拆分 → 空集（语义同 list_memories）
+        sql += " AND tier IN (%s)" % ",".join("?" * len(tiers))
+        params.extend(tiers)
+        if not states:
+            return None
+        sql += " AND status IN (%s)" % ",".join("?" * len(states))
+        params.extend(states)
+        sql += " ORDER BY updated_at DESC LIMIT 1"
+        row = self._conn.execute(sql, params).fetchone()
+        return _row_to_memory(row) if row else None
+
+    async def find_by_title(
+        self, tier: str, title: str, status: str,
+    ) -> MemoryRecord | None:
+        """按 tier+title+status 精确查一条（SOP 查重等存在性检查用）。
+
+        存在性检查不能用维护扫描游标（游标窗口外会漏判重复），也
+        不该用 ``list_memories(limit=100)`` 截断扫描（U1 债务⑤）。
+        """
+        return await self._run(self._find_by_title, tier, title, status)
 
     def _delete_memory(self, memory_id: str) -> None:
         self._conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
@@ -813,6 +882,28 @@ class RSIMemDatabase:
 
         await self._run(_set)
 
+    def _bump_meta(self, key: str) -> int:
+        """SELECT + UPSERT 自增，整个函数在调用方的单个 locked 段内执行。"""
+        row = self._conn.execute(
+            "SELECT value FROM meta WHERE key=?", (key,),
+        ).fetchone()
+        value = int(row["value"]) + 1 if row else 1
+        self._conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?,?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        return value
+
+    async def bump_meta(self, key: str) -> int:
+        """原子自增 meta 计数并返回自增后的值（U1 债务④）。
+
+        单次 ``_run`` 内单个 locked 段完成读-改-写，替代调用方
+        ``get_meta`` + ``set_meta`` 两次独立 await 的丢更新窗口
+        （并发计数不再互相覆盖）；多 worker 经 WAL 单连接天然合并。
+        """
+        return await self._run(self._bump_meta, key)
+
     async def stats(self) -> dict[str, Any]:
         """给 rsi_status / memory_status 用的一览统计。"""
         def _stats() -> dict[str, Any]:
@@ -840,14 +931,33 @@ class RSIMemDatabase:
                 int(row["v"]) if row and row["v"] is not None else -1
             )
             # —— 断链计数（U3）：target 缺失 / status 失效 / 短期已过期 ——
+            # SQL 预过滤掉空链行（大库绝大多数行 links='[]'，不必逐行
+            # json.loads），逐行解析包 try/except：脏 JSON 跳过并计入
+            # broken_json 返回键，不影响 broken_links 语义（U1 债务②）。
+            # target 解析表仍取全量行 —— 空链行也可以是合法 target。
             rows = self._conn.execute(
-                "SELECT id, tier, status, expires_at, links FROM memories",
+                "SELECT id, tier, status, expires_at, links FROM memories"
+                " WHERE links != '[]' AND links != ''",
             ).fetchall()
-            by_id = {r["id"]: r for r in rows}
+            by_id = {
+                r["id"]: r for r in self._conn.execute(
+                    "SELECT id, tier, status, expires_at FROM memories",
+                ).fetchall()
+            }
             now = time.time()
             broken = 0
+            broken_json = 0
             for r in rows:
-                for link in json.loads(r["links"]):
+                try:
+                    links = json.loads(r["links"])
+                except ValueError:
+                    broken_json += 1
+                    logger.warning(
+                        "stats(): 记忆 %s 的 links 列不是合法 JSON，"
+                        "跳过断链计数", r["id"],
+                    )
+                    continue
+                for link in links:
                     target = by_id.get(link.get("target_id"))
                     if (
                         target is None
@@ -860,6 +970,7 @@ class RSIMemDatabase:
                     ):
                         broken += 1
             out["broken_links"] = broken
+            out["broken_json"] = broken_json
             return out
 
         return await self._run(_stats)

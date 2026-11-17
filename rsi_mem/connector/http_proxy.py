@@ -38,9 +38,11 @@ app = FastAPI(title="rsi-mem-proxy", version="0.1.0")
 
 _CTX: RSIMemContext | None = None
 _CLIENT: httpx.AsyncClient | None = None
-_PROXY_TURNS = 0
-"""代理侧回合计数：每 every_n_turns 条轨迹触发一次固化审查
-（镜像 memory_middleware 的周期审查，纯代理部署可达同等防御）。"""
+_BG_TASKS: set[asyncio.Task] = set()
+"""后台固化任务的强引用集合：事件循环只持有弱引用，不存引用会被
+GC 中途回收；done 回调即移除（U1 债务④）。回合计数在 DB 的
+``meta['proxy_turns']``（``bump_meta`` 原子自增，多 worker 经 WAL
+单连接合并），不再用进程内变量。"""
 
 
 def init_proxy(context: RSIMemContext | None = None) -> RSIMemContext:
@@ -247,7 +249,6 @@ async def _save_trace(
     used_memory_ids: list[str] | None = None,
     has_answer: bool | None = None,
 ) -> None:
-    global _PROXY_TURNS
     recorder = TraceRecorder(
         ctx.db, ctx.config, session_id="http-proxy", query=query,
     )
@@ -279,8 +280,10 @@ async def _save_trace(
     if ctx.config.rsi.enabled:
         ctx.engine.on_trace_finished()
     # —— 周期固化审查（镜像 memory_middleware 的计数触发）——
-    _PROXY_TURNS += 1
-    if _PROXY_TURNS % ctx.config.review.every_n_turns == 0:
+    # 计数原子落 meta（bump_meta 单 locked 段读-改-写，替代进程内
+    # 变量的 get+set 丢更新窗口）；后台任务持强引用防 GC 中途回收
+    turns = await ctx.db.bump_meta("proxy_turns")
+    if turns % ctx.config.review.every_n_turns == 0:
 
         async def _consolidate() -> None:
             try:
@@ -289,4 +292,6 @@ async def _save_trace(
             except Exception as e:  # noqa: BLE001
                 logger.warning("proxy consolidation failed: %s", e)
 
-        asyncio.create_task(_consolidate())
+        task = asyncio.create_task(_consolidate())
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)

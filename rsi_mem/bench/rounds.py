@@ -188,6 +188,13 @@ async def run_bench(
             "conservative_mode": dream["conservative_mode"],
             "dropped_by_gate": dream["dropped_by_gate"],
             "candidates": dream["candidates"],
+            # U4：ρ 扫描前沿面积与选择器（取顶层键，不靠 replays 猜行）
+            "pareto_auc": (
+                dream.get("pareto_auc_winner")
+                if dream.get("deployed")
+                else dream.get("pareto_auc_v0")
+            ),
+            "selector": dream.get("selector"),
         })
 
     first, last = rows[0], rows[-1]
@@ -209,6 +216,19 @@ async def run_bench(
             "prediction_samples": len(predictions),
             "non_degraded": (
                 last["quality_after"] >= first["quality_after"] - 0.02
+            ),
+            # U4 增量字段（观测先行：不做 AUC 阈值断言——环境奖励
+            # char_budget≥1200，质量寻求部署会合理压低 AUC，阈值待
+            # bench_report 积累后下轮再定）
+            "pareto_auc_first": first.get("pareto_auc"),
+            "pareto_auc_last": last.get("pareto_auc"),
+            "pareto_auc_delta": round(
+                (last.get("pareto_auc") or 0.0)
+                - (first.get("pareto_auc") or 0.0), 4,
+            ),
+            "balanced_deploys": sum(
+                1 for x in rows
+                if x["deployed"] and x.get("selector") == "balanced"
             ),
         },
     }
@@ -237,27 +257,35 @@ def format_report_table(report: dict[str, Any]) -> str:
     """把基准报告渲染成可读表格（CLI 打印用）。"""
     header = (
         f"{'轮':>3} {'v前':>4} {'v后':>4} {'部署':>4} {'算子':<18} "
-        f"{'质量':>6} {'成本':>7} {'MAE':>6} {'样本':>4} {'保守':>4}"
+        f"{'质量':>6} {'成本':>7} {'AUC':>6} {'MAE':>6} {'样本':>4} {'保守':>4}"
     )
     lines = [header, "-" * len(header)]
     for r in report["rows"]:
         mae = r["predictor_mae"]
         mae_str = f"{mae:.3f}" if mae is not None else "-"
+        auc = r.get("pareto_auc")
+        auc_str = f"{auc:.4f}" if isinstance(auc, (int, float)) else "-"
         lines.append(
             f"{r['round']:>3} {r['version_before']:>4} "
             f"{r['version_after']:>4} "
             f"{'是' if r['deployed'] else '否':>4} "
             f"{(r['operator'] or '-'):<18} "
             f"{r['quality_after']:>6} {r['est_cost_after']:>7} "
+            f"{auc_str:>6} "
             f"{mae_str:>6} "
             f"{r['predictor_samples']:>4} "
             f"{'是' if r['conservative_mode'] else '否':>4}",
         )
     s = report["summary"]
+    auc_d = s.get("pareto_auc_delta")
+    auc_d_str = f"{auc_d:+.4f}" if isinstance(auc_d, (int, float)) else "-"
     lines.append("-" * len(header))
     lines.append(
-        f"总结: 首轮质量 {s['quality_first']} → 末轮 {s['quality_last']} "
-        f"(Δ={s['quality_delta']:+.4f}), 部署 {s['deploys']}/{report['rounds']} 轮, "
+        f"总结: 首轮质量 {s['quality_first']} → 末轮质量 {s['quality_last']} "
+        f"(Δ={s['quality_delta']:+.4f}), 部署 {s['deploys']}/{report['rounds']} 轮 "
+        f"(balanced {s.get('balanced_deploys', '-')}), "
+        f"AUC {s.get('pareto_auc_first', '-')} → {s.get('pareto_auc_last', '-')} "
+        f"(Δ={auc_d_str}), "
         f"预测样本 {s['prediction_samples']}, "
         f"非退化 {'通过' if s['non_degraded'] else '未通过'}",
     )

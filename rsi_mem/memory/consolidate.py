@@ -20,7 +20,7 @@ from agentscope._logging import logger
 from agentscope.model import ChatModelBase
 
 from ..config import RSIMemConfig
-from ..storage import PendingReview, TraceRecord
+from ..storage import MemoryRecord, PendingReview, TraceRecord
 from .guards import (
     broken_link_reason,
     find_contradictions,
@@ -107,6 +107,46 @@ class Consolidator:
         return out
 
     # ------------------------------------------------------------------
+    # 维护扫描游标（U1 债务⑤）
+    # ------------------------------------------------------------------
+    async def _cursor_scan(
+        self, slot: str, limit: int, **filters: Any,
+    ) -> list[MemoryRecord]:
+        """判定型维护扫描的游标轮转。
+
+        读 ``meta["scan_cursor:<slot>"]``（``"<updated_at>:<id>"`` 复
+        合游标）作 ``list_memories`` 的 ``(updated_before, cursor_id)``
+        边界——主边界 ``<=`` 含边界行（判定型扫描幂等，重复无害）；
+        并列时间戳组超过 ``limit`` 时纯时间戳边界会永远重复同一窗
+        （SQLite 稳定排序，本会话实测），组内按 id 走窗保证不跳行。
+        本轮结果数 < ``limit`` 视为扫到尾，游标重置（空串）下一轮回
+        到最新端。防单轮 ``list_memories(limit=…)`` 只见最新窗口、
+        老记录永远轮不到审查的截断问题。
+
+        注意：**存在性检查不得走本方法**（游标窗口外漏判）——如 SOP
+        查重用 :meth:`RSIMemDatabase.find_by_title` 精确查询。
+        """
+        db = self._tiers._db
+        key = f"scan_cursor:{slot}"
+        raw = await db.get_meta(key)
+        cursor_ts: float | None = None
+        cursor_id: str | None = None
+        if raw:
+            ts_text, _, id_text = raw.partition(":")
+            cursor_ts = float(ts_text)
+            cursor_id = id_text or None
+        batch = await db.list_memories(
+            limit=limit, updated_before=cursor_ts, cursor_id=cursor_id,
+            **filters,
+        )
+        if len(batch) < limit:
+            await db.set_meta(key, "")  # 扫到尾：游标归位，下轮从头
+        else:
+            last = batch[-1]  # updated_at DESC, id DESC 序的窗口末位
+            await db.set_meta(key, f"{last.updated_at}:{last.id}")
+        return batch
+
+    # ------------------------------------------------------------------
     # 短期 → 长期 晋升
     # ------------------------------------------------------------------
     async def _propose_promotions(
@@ -171,11 +211,12 @@ class Consolidator:
         if count < _SOP_MIN_REPEAT:
             return None
         # —— SOP 查重：同 title active SOP 已存在 → 不再提议 ——
+        # 精确查询（U1 债务⑤）：存在性检查不能走游标窗口（窗口外
+        # 漏判重复），也不能靠 list_memories(limit=100) 截断扫描
         title = f"SOP: {sample_query or '常见运维流程'}"
-        muscles = await self._tiers._db.list_memories(
-            tier="muscle", status="active,promoted", limit=100,
-        )
-        if any(m.title == title for m in muscles):
+        if await self._tiers._db.find_by_title(
+            tier="muscle", title=title, status="active,promoted",
+        ) is not None:
             return None
         steps = "\n".join(f"{i}. 执行 `{n}`" for i, n in enumerate(seq, 1))
         content = (
@@ -229,12 +270,14 @@ class Consolidator:
         model = model or self._config.backend_model
         proposals: list[PendingReview] = []
         memories = [
+            # L3 注入面小（≤30），直接超取；muscle 面可大 → 游标轮转
             *await db.list_memories(
                 tier="long", layer="L3_core",
                 status="active,promoted", limit=30,
             ),
-            *await db.list_memories(
-                tier="muscle", status="active,promoted", limit=100,
+            *await self._cursor_scan(
+                "verify_muscle", 100,
+                tier="muscle", status="active,promoted",
             ),
         ]
         pending_keys = {
@@ -444,8 +487,8 @@ class Consolidator:
         """
         db = self._tiers._db
         now = time.time()
-        hosts = await db.list_memories(
-            tier="long,short", status="active,promoted", limit=500,
+        hosts = await self._cursor_scan(
+            "link_repair", 500, tier="long,short", status="active,promoted",
         )
         out: list[PendingReview] = []
         for host in hosts:
@@ -554,8 +597,8 @@ class Consolidator:
     # ------------------------------------------------------------------
     async def _propose_maintenance(self) -> list[PendingReview]:
         out: list[PendingReview] = []
-        muscles = await self._tiers._db.list_memories(
-            tier="muscle", status="active", limit=100,
+        muscles = await self._cursor_scan(
+            "maintenance_muscle", 100, tier="muscle", status="active",
         )
         for m in muscles:
             if m.use_count >= 10 and m.hit_count == 0:
@@ -577,9 +620,9 @@ class Consolidator:
         ``long_soft_cap/2`` → ``archive_memory`` 提议（0.6 人工确认）。
         """
         db = self._tiers._db
-        l0s = await db.list_memories(
-            tier="long", layer="L0_raw",
-            status="active,promoted", limit=1000,
+        l0s = await self._cursor_scan(
+            "l0_recycle", 1000,
+            tier="long", layer="L0_raw", status="active,promoted",
         )
         if len(l0s) <= self._config.review.long_soft_cap // 2:
             return []

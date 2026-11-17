@@ -10,7 +10,12 @@
 """
 from __future__ import annotations
 
+import time
+
+from agentscope._logging import logger
+
 from ..storage import MemoryLink, MemoryRecord, MirrorStore, RSIMemDatabase
+from .guards import broken_link_reason
 from .retrieval import Retriever
 
 
@@ -101,15 +106,32 @@ class LongTermStore:
 
         归档前写 ``source["merged_into"]=primary_id`` 并**即时重定向**
         指向 duplicate 的 related 链接（U3：merge 的链接语义闭环）；
-        断链修复插槽对漏网链接按 ``merged_into`` 重定向。幂等：已带
-        ``merged_into`` 的 duplicate 直接返回 primary。
+        断链修复插槽对漏网链接按 ``merged_into`` 重定向。幂等分支
+        **跟随 merged_into 锚点**（U1 债务①）：已合并过的 duplicate
+        不再机械返回入参 primary —— 那会让返回值与既有链接指向
+        （第一次合并已重定向到锚点）不一致。锚点存活则返回锚点并把
+        指向本次 primary 的 related 链接重定向过去；锚点失联（已删除/
+        归档不可恢复）则告警后把 ``merged_into`` 改指本次 primary，
+        走正常合并路径。
         """
         primary = await self._db.get_memory(primary_id)
         duplicate = await self._db.get_memory(duplicate_id)
         if primary is None or duplicate is None:
             return None
         if duplicate.source.get("merged_into"):
-            return primary  # 已合并过（幂等）
+            anchor_id = str(duplicate.source["merged_into"])
+            anchor = await self._db.get_memory(anchor_id)
+            if broken_link_reason(anchor, time.time()) is None:
+                # 锚点存活：幂等返回锚点，并把指向本次 primary 的
+                # related 链接重定向到锚点（复用 _redirect_links）
+                if primary_id != anchor_id:
+                    await self._redirect_links(primary_id, anchor_id)
+                return anchor
+            logger.warning(
+                "merge 幂等锚点 %s 失联（%s），改锚 %s 重新合并",
+                anchor_id[:8], duplicate_id[:8], primary_id[:8],
+            )
+            # 锚点失联：落入正常合并路径（merged_into 改指 primary）
         if primary.content and duplicate.content not in primary.content:
             primary.content = (
                 f"{primary.content}\n\n[合并自 {duplicate_id[:8]}] "

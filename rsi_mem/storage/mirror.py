@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+from typing import Literal
 
 import frontmatter
 
@@ -169,18 +170,24 @@ class MirrorStore:
         memories: list[MemoryRecord],
         max_lines: int,
         max_chars: int,
+        unit: Literal["bytes", "chars"] = "bytes",
     ) -> tuple[list[str], list[str]]:
         """预算内渲染索引主题行，返回 ``(行, 入选记录 id)``。
 
-        行数/字节双上限对头行 + 主题行生效；行截断按主题名排序的
-        稳定键做前缀截断（确定性）；尾行提示由调用方追加、不计入。
+        行数与 ``max_chars`` 双上限对头行 + 主题行生效；``unit`` 选
+        字节（``INDEX.md`` 写盘口径）或字符（注入路径 ``l3_char_budget``
+        合计口径，U1 债务⑥ 统一到字符）；行截断按主题名排序的稳定键
+        做前缀截断（确定性）；尾行提示由调用方追加、不计入。
         """
         clusters = self.cluster_topics(memories)
         if not clusters:
             return [], []
         lines: list[str] = []
         ids: list[str] = []
-        used = len(self._INDEX_HEADER.encode("utf-8"))
+        used = len(
+            self._INDEX_HEADER.encode("utf-8") if unit == "bytes"
+            else self._INDEX_HEADER
+        )
         lines_budget = max(0, max_lines - 1)  # 头行占一行
         for topic, anchor, members in clusters:
             if len(lines) >= lines_budget:
@@ -192,7 +199,10 @@ class MirrorStore:
                 f"- [{topic}](./{self._page_filename(topic, anchor)})"
                 f"（{len(members)} 条）：{heads}"
             )
-            cost = len(line.encode("utf-8"))
+            cost = (
+                len(line.encode("utf-8")) if unit == "bytes"
+                else len(line)
+            )
             if used + cost > max_chars:
                 break  # 前缀截断（稳定键确定性）
             used += cost
@@ -205,10 +215,11 @@ class MirrorStore:
         memories: list[MemoryRecord],
         max_lines: int,
         max_chars: int,
+        unit: Literal["bytes", "chars"] = "bytes",
     ) -> str:
         """渲染顶部小索引（中间件/代理/INDEX.md 共用同一渲染器）。"""
         block, _ids = self.render_index_block_with_ids(
-            memories, max_lines, max_chars,
+            memories, max_lines, max_chars, unit=unit,
         )
         return block
 
@@ -217,10 +228,14 @@ class MirrorStore:
         memories: list[MemoryRecord],
         max_lines: int,
         max_chars: int,
+        unit: Literal["bytes", "chars"] = "bytes",
     ) -> tuple[str, list[str]]:
         """同 :meth:`render_index_block`，并返回入选记录 id（供 ids
-        回填轨迹 / settle）。无簇时返回空串（调用方跳过该段）。"""
-        lines, ids = self._index_lines(memories, max_lines, max_chars)
+        回填轨迹 / settle）。无簇时返回空串（调用方跳过该段）。
+        ``INDEX.md`` 写盘保持默认字节口径（rebuild_wiki 不动）。"""
+        lines, ids = self._index_lines(
+            memories, max_lines, max_chars, unit=unit,
+        )
         if not lines:
             return "", []
         block = "\n".join(

@@ -43,6 +43,28 @@ def score_outcome(
     return max(0.0, min(1.0, score))
 
 
+_SERIAL_GAP_S = 0.5
+"""串行轮数估计的切批间隔：``at`` 间隔超过该值视为新一轮。"""
+
+
+def serial_rounds_k(calls: list[ToolCallNode]) -> int:
+    """k*：按 ``at`` 间隔 >0.5s 聚类估计的串行轮数（U3-3a）。
+
+    完全并行的一批调用（间隔 < 0.5s）算一轮；完全串行的 n 次调用
+    （间隔 ≥ 2×gap）得 k*=n。``calls`` 为空返回 0。回放的并行度惩罚
+    （``parallel_lambda``）与本函数共用同一口径。
+    """
+    if not calls:
+        return 0
+    rounds = 0
+    last_at: float | None = None
+    for c in sorted(calls, key=lambda c: c.at):
+        if last_at is None or c.at - last_at > _SERIAL_GAP_S:
+            rounds += 1
+        last_at = c.at
+    return rounds
+
+
 class TraceRecorder:
     """单次 reply 的轨迹收集器。"""
 
@@ -76,6 +98,7 @@ class TraceRecorder:
                 input_digest=input_digest[:200],
                 state=state,  # type: ignore[arg-type]
                 latency_s=round(latency_s, 3),
+                step_index=len(self.record.tool_calls),  # U3-3a 录制序号
             ),
         )
 
@@ -122,6 +145,9 @@ class TraceRecorder:
                 "tool_error_ratio": round(error_ratio, 3),
                 "tool_calls": len(calls),
                 "model_calls": len(self.record.model_calls),
+                # (n,k*) 数据（U3-3a）：回放并行度惩罚的数据前置
+                "calls_n": len(calls),
+                "serial_rounds_k": serial_rounds_k(calls),
             },
         )
         await self.upsert()

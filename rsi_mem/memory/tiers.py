@@ -85,8 +85,12 @@ class TierManager:
         """中间件与代理共用的渲染路径（U4）。
 
         组装：基因组 always 片段 + L3 核心档案（超取 + l3_eligible
-        过滤）+ 顶部小索引 + 命中反射 —— 同一 ``l3_char_budget`` 合计
-        预算（索引段字符在 U3 预留的 ``L3_INDEX_MARGIN`` 余量内）。
+        过滤 + **运行时合计截断**）+ 顶部小索引 + 命中反射 —— 同一
+        ``l3_char_budget`` 合计预算（索引段字符在 ``L3_INDEX_MARGIN``
+        余量内）。L3 段运行时截断与 U3 瘦身插槽同值同口径（字符）：
+        预算 ``l3_char_budget − L3_INDEX_MARGIN``，超限按
+        (trace_verified, hit_count) 排序保留头部 —— 瘦身提案降级的是
+        库内条目，截断兜底的是两次审查之间的注入面（U1 债务⑥）。
 
         Returns:
             ``(sections, 注入记忆 id 列表)``。
@@ -102,10 +106,31 @@ class TierManager:
             core = await self.retriever.core_profile()
             if core:
                 sections.append("## 核心档案（长期记忆 L3，每轮可见）")
-                sections.extend(f"- {c.display(200)}" for c in core)
-                used_ids.extend(c.id for c in core)
+                budget = (
+                    self._config.review.l3_char_budget - L3_INDEX_MARGIN
+                )
+                ranked = sorted(
+                    core,
+                    key=lambda c: (
+                        verification_of(c).state == "trace_verified",
+                        c.hit_count,
+                    ),
+                    reverse=True,
+                )
+                kept: list[MemoryRecord] = []
+                used = 0
+                for c in ranked:
+                    cost = len(c.display(200))
+                    if used + cost > budget and kept:
+                        break  # 保留头部：首个必留，其后按序装满即止
+                    used += cost
+                    kept.append(c)
+                sections.extend(f"- {c.display(200)}" for c in kept)
+                used_ids.extend(c.id for c in kept)
 
         # —— 顶部小索引（U4）：注入不依赖 rebuild，DB 直渲染 ——
+        # 索引段按字符口径（与 L3 段合计口径统一；INDEX.md 写盘
+        # 仍走 rebuild_wiki 的默认字节口径）
         if self._config.wiki.enabled:
             long_recs = await self._db.list_memories(
                 tier="long", status="active,promoted", limit=500,
@@ -120,6 +145,7 @@ class TierManager:
                         index_memories,
                         max_lines=self._config.wiki.index_max_lines,
                         max_chars=L3_INDEX_MARGIN,
+                        unit="chars",
                     )
                 )
                 if block:
@@ -327,12 +353,11 @@ class TierManager:
 
         if action == "create_muscle":
             # 幂等守卫：同 title 的 active SOP 已存在则直接返回，
-            # 不重复 INSERT（配合 _distill_sop 的提议前查重）
-            existing = await self._db.list_memories(
-                tier="muscle", status="active,promoted", limit=100,
-            )
-            dup = next(
-                (m for m in existing if m.title == payload["title"]), None,
+            # 不重复 INSERT（配合 _distill_sop 的提议前查重；精确
+            # 查询，不吃 list_memories 的 limit 截断 —— U1 债务⑤）
+            dup = await self._db.find_by_title(
+                tier="muscle", title=payload["title"],
+                status="active,promoted",
             )
             if dup is not None:
                 return dup

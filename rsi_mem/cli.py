@@ -133,6 +133,64 @@ async def doctor(ctx: RSIMemContext) -> dict[str, Any]:
             None,
         )
 
+    # —— 子问题覆盖（U4：U2 MOEA/D 回归哨兵，E2）——
+    # meta 'rsi_moead_incumbents' 全同 version 且多子问题 → λ≥1 的
+    # 邻域替换从未产生独立 incumbent（per-λ 机制退化为单 λ）
+    if len(ctx.config.rsi.subproblems) > 1:
+        try:
+            pool = json.loads(
+                await ctx.db.get_meta("rsi_moead_incumbents") or "{}",
+            )
+            if not isinstance(pool, dict):
+                pool = {}
+        except ValueError:
+            pool = {}
+        versions: set[Any] = set()
+        for item in pool.values():
+            if not (isinstance(item, dict) and item.get("spec_json")):
+                continue
+            try:
+                versions.add(
+                    json.loads(item["spec_json"]).get("version"),
+                )
+            except ValueError:
+                continue
+        if (
+            len(pool) >= len(ctx.config.rsi.subproblems)
+            and len(versions) == 1
+        ):
+            add(
+                "warn",
+                "第二子问题从未激活：全部 per-λ incumbent 同版本"
+                f"（v{next(iter(versions))}），λ≥1 邻域替换未生效"
+                "（U2 回归哨兵，E2）",
+                {"versions": sorted(x for x in versions if x is not None)},
+            )
+
+    # —— Pareto 退化（U4，P7：读事件日志，E2）——
+    # 末 5 次 dream end 的 pareto_auc_winner 持续下降且总降幅 >0.1
+    # 才告警；事件日志缺失 / 无该字段（旧版本事件）时静默降级不误报
+    auc_series = [
+        e["payload"]["pareto_auc_winner"]
+        for e in dream_events
+        if e["payload"].get("phase") == "end"
+        and isinstance(
+            e["payload"].get("pareto_auc_winner"), (int, float),
+        )
+    ]
+    if len(auc_series) >= 5:
+        tail = auc_series[-5:]
+        if (
+            all(tail[i] > tail[i + 1] for i in range(len(tail) - 1))
+            and tail[0] - tail[-1] > 0.1
+        ):
+            add(
+                "warn",
+                f"Pareto 前沿面积连续下滑：末 5 次梦 {tail[0]:.3f} → "
+                f"{tail[-1]:.3f}（E2，观测先行——阈值待积累后校准）",
+                {"series": [round(x, 4) for x in tail]},
+            )
+
     if not findings:
         add("ok", "未发现异常", None)
 

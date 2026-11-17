@@ -10,6 +10,7 @@ from rsi_mem.memory import TierManager
 from rsi_mem.memory.consolidate import Consolidator, summarize_feedback
 from rsi_mem.memory.extract import TurnExtractor
 from rsi_mem.storage import (
+    MemoryLink,
     MemoryRecord,
     MirrorStore,
     OutcomeRecord,
@@ -213,3 +214,57 @@ async def test_summarize_feedback(ctx):
     assert s["count"] == 3
     assert s["positive_feedback"] == 1 and s["negative_feedback"] == 1
     assert 0.5 < s["mean_outcome"] < 0.6
+
+
+# ---------------------------------------------------------------------------
+# U1 债务①：merge 幂等锚点一致性
+# ---------------------------------------------------------------------------
+
+async def test_merge_idempotent_follows_anchor(ctx):
+    """幂等分支跟随 merged_into 锚点：返回值与链接指向恒一致。
+
+    merge(A,B) 后再 merge(C,B)：duplicate=B 已带 ``merged_into=A``，
+    幂等分支应返回锚点 A（而非入参 C），并把指向 C 的 related 链接
+    重定向到 A —— 否则返回值（C）与既有链接指向（A）漂移。
+    """
+    a = await ctx.tiers.longterm.add(title="锚点条目", content="A 内容。")
+    b = await ctx.tiers.longterm.add(title="重复条目", content="B 内容。")
+    c = await ctx.tiers.longterm.add(title="新主条目", content="C 内容。")
+    first = await ctx.tiers.longterm.merge(a.id, b.id)
+    assert first is not None and first.id == a.id
+    # 宿主指向本次 primary C（模拟后来者把 C 当作该知识的入口）
+    host = await ctx.tiers.longterm.add(
+        title="宿主", content="H 内容。",
+        links=[MemoryLink(target_id=c.id, kind="related")],
+    )
+    second = await ctx.tiers.longterm.merge(c.id, b.id)
+    assert second is not None and second.id == a.id, \
+        "幂等分支应返回 merged_into 锚点，而非入参 primary"
+    loaded_host = await ctx.db.get_memory(host.id)
+    assert [l.target_id for l in loaded_host.links] == [a.id], \
+        "指向本次 primary 的 related 链接应重定向到锚点"
+    # C 本体不被幂等分支改动（内容不追加、不落 merged_into）
+    loaded_c = await ctx.db.get_memory(c.id)
+    assert loaded_c.content == "C 内容。" and loaded_c.status == "active"
+
+
+async def test_merge_reanchors_when_anchor_lost(ctx):
+    """锚点失联分支：锚点被删后幂等 merge 改锚重并，不抛错。"""
+    a = await ctx.tiers.longterm.add(title="旧锚点", content="A 内容。")
+    b = await ctx.tiers.longterm.add(title="重复条目", content="B 内容。")
+    await ctx.tiers.longterm.merge(a.id, b.id)
+    d = await ctx.tiers.longterm.add(title="接盘主", content="D 内容。")
+
+    await ctx.db.delete_memory(a.id)  # 锚点失联（已删除）
+    merged = await ctx.tiers.longterm.merge(d.id, b.id)
+    assert merged is not None and merged.id == d.id, \
+        "锚点失联应走正常合并路径并返回新 primary"
+    loaded_b = await ctx.db.get_memory(b.id)
+    assert loaded_b.source.get("merged_into") == d.id, \
+        "merged_into 应改指新 primary"
+    assert loaded_b.status == "archived"
+    assert "B 内容。" in (await ctx.db.get_memory(d.id)).content, \
+        "正常合并路径仍并入 duplicate 要点"
+    again = await ctx.tiers.longterm.merge(d.id, b.id)
+    assert again is not None and again.id == d.id, \
+        "改锚后再 merge 幂等（锚点=primary，返回锚点）"

@@ -33,8 +33,11 @@ from ..storage import GenomeSpec, RSIMemDatabase, TraceRecord
 from .objectives import (
     ObjectiveVector,
     cost_efficiency,
+    pareto_frontier_auc,
+    parallel_penalty,
     safety_from_signals,
 )
+from .trace import serial_rounds_k
 
 _CHARS_PER_TOKEN = 2.0
 """注入字符 → token 的粗折算（中文偏保守）。"""
@@ -49,6 +52,9 @@ _JUDGE_SYSTEM = (
     "统计与失败模式）评估【候选变更】的预期效果。只输出 JSON："
     "{\"quality_delta\": -1..1, \"reason\": \"一句话\"}。"
     "拿不准就给 0。禁止编造证据里没有的结论。"
+    "评审只依据【证据】中已揭示的**前缀**统计（前缀工具序列 / 工具"
+    "错误分布 / 查询摘录 / (n,k*) 数据）；证据不提供任何结局分数，"
+    "禁止引用或推断结局绝对分数（附录 D.2 前缀盲评约束）。"
 )
 
 
@@ -63,10 +69,89 @@ class ReplayReport:
     judge_reason: str = ""
     judge_delta: float = 0.0
     details: dict[str, Any] = field(default_factory=dict)
+    pareto_auc: float = 1.0
+    """Eq.1 Pareto 前沿下面积（ρ 扫描，[0,1] 越大越好）。空样本默认
+    1.0（无点集无从计算，保持旧测试口径）。"""
+    points: list[dict[str, Any]] = field(default_factory=list)
+    """ρ 扫描点集：每轨迹 {trace_id, points: [[n,a]×|ρ|], budget}。"""
+    is_v0: bool = False
+    """engine 对 v0 条目置 True（U3-3b 起回放报告显式标注基准位）。"""
 
 
 def _fragment_chars(genome: GenomeSpec) -> int:
     return sum(len(f.text) for f in genome.prompt_fragments if f.enabled)
+
+
+_PREFIX_STEPS = 5
+"""前缀视图里每条被引用轨迹揭示的工具步数上限。"""
+
+
+def _prefix_view(
+    diagnosis: dict[str, Any] | None,
+    traces: list[TraceRecord] | None = None,
+) -> dict[str, Any]:
+    """judge 证据的前缀视图（U3-3a）：剥离结局分数，(n,k*) 数据前置。
+
+    - 剥离 ``worst/best_traces[].score`` 与 ``stats.mean_outcome`` ——
+      结局分数不进评审视野（防评审锚定绝对分数；诊断全量数据仍留给
+      策略侧 ``hypothesize``，improver 不动）；
+    - 保留 ``error_tools`` / ``ok_tools`` / ``query`` 摘录，并按轨迹
+      id 匹配 ``traces`` 前置每条摘录的**前缀工具序列**（``step_index``
+      序前 5 步 name+state，无任何分数）与 ``calls_n`` /
+      ``serial_rounds_k``（(n,k*) 数据前置）。
+
+    ``traces`` 为 None 时只做剥离（无前缀序列可挂）。返回浅拷贝，
+    不改入参。
+    """
+    if not isinstance(diagnosis, dict):
+        return {}
+    out = dict(diagnosis)
+    stats = out.get("stats")
+    if isinstance(stats, dict):
+        out["stats"] = {
+            k: v for k, v in stats.items() if k != "mean_outcome"
+        }
+    by_id = {t.id: t for t in (traces or [])}
+    for key in ("worst_traces", "best_traces"):
+        rows = out.get(key)
+        if not isinstance(rows, list):
+            continue
+        kept_rows = []
+        for r in rows:
+            if not isinstance(r, dict):
+                kept_rows.append(r)
+                continue
+            row = {k: v for k, v in r.items() if k != "score"}
+            trace = by_id.get(str(row.get("id") or ""))
+            if trace is not None:
+                steps = sorted(
+                    trace.tool_calls,
+                    key=lambda c: (
+                        c.step_index if c.step_index is not None else 1 << 30,
+                        c.at,
+                    ),
+                )[:_PREFIX_STEPS]
+                row["prefix_tools"] = [
+                    {
+                        "step": (
+                            c.step_index
+                            if c.step_index is not None else i
+                        ),
+                        "name": c.name,
+                        "state": c.state,
+                    }
+                    for i, c in enumerate(steps)
+                ]
+                row["calls_n"] = len(trace.tool_calls)
+                row["serial_rounds_k"] = serial_rounds_k(trace.tool_calls)
+            kept_rows.append(row)
+        out[key] = kept_rows
+    return out
+
+
+def _lerp(a: float, b: float, t: float) -> float:
+    """线性插值 a→b（t∈[0,1]）。"""
+    return a + (b - a) * t
 
 
 def _first_text(resp: Any) -> str:
@@ -99,20 +184,56 @@ class ReplayEvaluator:
         judge_model: ChatModelBase | None = None,
         diagnosis_summary: dict[str, Any] | None = None,
     ) -> ReplayReport:
-        """评估候选，返回三目标向量与明细。"""
+        """评估候选，返回三目标向量、ρ 扫描点集与 Pareto 前沿面积。
+
+        U3-3b：检索参数在 ``RetrievalParams`` 边界内按 ρ∈``rho_grid``
+        插值（top_k/char_budget 线性、threshold 不动），逐 (trace, ρ)
+        得归一化质量-成本点 (n_iρ, a_iρ)；``pareto_auc`` = Eq.1 前沿
+        面积均值 − 并行度惩罚（k*/n 由 ``at`` 间隔 >0.5s 聚类估计）。
+        judge 只调一次（与 ρ 无关），证据为前缀视图（3a）。
+        ``objective`` 单点产出保持：quality/cost 用 ρ=1 点（= 候选原
+        参数），兼容既有分量与测试。
+        """
         scored = [t for t in traces if t.outcome is not None]
         sample = scored[: self._config.rsi.regression_traces * 2]
+        model = judge_model or self._config.backend_model
 
-        cand_ids_per_trace: list[tuple[set[str], set[str]]] = []
-        est_tokens: list[float] = []
-        for trace in sample:
-            res_c = await self._retriever.search(
-                trace.query,
-                tiers=("long", "short"),
-                top_k=candidate.retrieval.top_k,
-                score_threshold=candidate.retrieval.score_threshold,
-                char_budget=candidate.retrieval.char_budget,
+        # ---- judge 一次（与 ρ 无关：rho_grid 不放大评审调用）----
+        judge_delta, judge_reason = 0.0, ""
+        if model is not None and candidate.operator != "seed":
+            judge_delta, judge_reason = await self._judge(
+                model, candidate, parent, diagnosis_summary or {},
+                traces=sample,
             )
+
+        base_quality = (
+            sum(t.outcome.score for t in scored) / len(scored)
+            if scored else 0.5
+        )
+        # ---- SOP 触发覆盖加成（E0 确定性）：候选激活的 SOP 与近期
+        # ---- 查询的对齐度越高，预期质量加成越大。
+        sop_coverage = await self._sop_trigger_coverage(
+            candidate, sample,
+        )
+        quality_floor = (
+            _SOP_COVERAGE_BONUS * sop_coverage
+            + 0.15 * max(-1.0, min(1.0, judge_delta))
+        )
+
+        # ---- per-(trace, ρ) 双层扫描（U3-3b）----
+        rho_grid = list(self._config.rsi.rho_grid) or [1.0]
+        full_rho = 1.0 if 1.0 in rho_grid else max(rho_grid)
+        coverage_penalty: dict[float, float] = {r: 0.0 for r in rho_grid}
+        checks = 0
+        points: list[dict[str, Any]] = []
+        est_tokens_full: list[float] = []
+        aucs: list[float] = []
+        k_over_n: list[float] = []
+        # S = 池内最高 outcome.score（a 的归一分母；P10：S≤0 → a≡0）
+        max_score = max(
+            (t.outcome.score for t in scored), default=0.0,
+        )
+        for trace in sample:
             res_p = await self._retriever.search(
                 trace.query,
                 tiers=("long", "short"),
@@ -120,29 +241,15 @@ class ReplayEvaluator:
                 score_threshold=parent.retrieval.score_threshold,
                 char_budget=parent.retrieval.char_budget,
             )
-            cand_ids_per_trace.append(
-                ({r.record.id for r in res_c},
-                 {r.record.id for r in res_p}),
+            parent_ids = {r.record.id for r in res_p}
+            chars_p = (
+                sum(len(r.record.display()) for r in res_p)
+                + _fragment_chars(parent)
             )
-            chars_c = sum(
-                len(r.record.display()) for r in res_c
-            ) + _fragment_chars(candidate)
-            chars_p = sum(
-                len(r.record.display()) for r in res_p
-            ) + _fragment_chars(parent)
-            est_tokens.append(
-                max(0.0, trace.total_tokens + (chars_c - chars_p)
-                    / _CHARS_PER_TOKEN),
-            )
-
-        # ---- 回归覆盖：成功轨迹用过的、父代当前能召回的记忆，
-        # ---- 候选参数下必须仍然召回（回归保障）。
-        coverage_penalty = 0.0
-        checks = 0
-        for trace, (cand_ids, parent_ids) in zip(sample, cand_ids_per_trace):
+            # 回归覆盖锚点（父代可召回的才纳入检查；与 ρ 无关）
             used = {
                 mid for mid in trace.used_memory_ids
-                if mid in parent_ids  # 父代当前能召回的才纳入检查
+                if mid in parent_ids
             }
             used = {
                 mid for mid in used
@@ -150,50 +257,108 @@ class ReplayEvaluator:
                 and rec.tier in ("long", "short")
                 and rec.status in ("active", "promoted")
             }
-            if not used:
-                continue
-            checks += 1
-            lost = len(used - cand_ids) / len(used)
-            coverage_penalty += _COVERAGE_PENALTY * lost
+            if used:
+                checks += 1
+            per_rho: list[tuple[float, float]] = []  # (n_iρ, a_iρ)
+            per_rho_n: dict[float, float] = {}
+            for rho in rho_grid:
+                top_k = max(
+                    1, round(_lerp(1, candidate.retrieval.top_k, rho)),
+                )
+                char_budget = max(
+                    200,
+                    round(_lerp(200, candidate.retrieval.char_budget, rho)),
+                )
+                res_c = await self._retriever.search(
+                    trace.query,
+                    tiers=("long", "short"),
+                    top_k=top_k,
+                    score_threshold=candidate.retrieval.score_threshold,
+                    char_budget=char_budget,
+                )
+                cand_ids = {r.record.id for r in res_c}
+                chars_c = (
+                    sum(len(r.record.display()) for r in res_c)
+                    + _fragment_chars(candidate)
+                )
+                per_rho_n[rho] = max(
+                    0.0,
+                    trace.total_tokens
+                    + (chars_c - chars_p) / _CHARS_PER_TOKEN,
+                )
+                lost = (
+                    len(used - cand_ids) / len(used) if used else 0.0
+                )
+                if used:
+                    coverage_penalty[rho] += _COVERAGE_PENALTY * lost
+                # 本点质量：coverage×base + SOP + judge 分量（ρ 只经
+                # coverage 起作用；judge/SOP 与 ρ 无关）
+                q_i_rho = max(
+                    0.0,
+                    min(
+                        1.0,
+                        base_quality * (1.0 - _COVERAGE_PENALTY * lost)
+                        + quality_floor,
+                    ),
+                )
+                a_i_rho = (
+                    max(0.0, min(1.0, q_i_rho / max_score))
+                    if max_score > 0.0 else 0.0
+                )
+                per_rho.append((per_rho_n[rho], a_i_rho))
+            # B_i = ρ=1（候选满预算）点的 est tokens
+            budget_i = per_rho_n.get(full_rho, 0.0)
+            est_tokens_full.append(budget_i)
+            aucs.append(pareto_frontier_auc(per_rho, budget_i))
+            points.append({
+                "trace_id": trace.id[:8],
+                "points": [
+                    [round(n, 1), round(a, 4)] for n, a in per_rho
+                ],
+                "budget": round(budget_i, 1),
+            })
+            if trace.tool_calls:
+                k_over_n.append(
+                    serial_rounds_k(trace.tool_calls)
+                    / len(trace.tool_calls),
+                )
+
+        # ---- 覆盖与单点三目标（ρ=1 全局口径，兼容旧语义）----
         coverage = (
-            1.0 - coverage_penalty / checks if checks else 1.0
+            1.0 - coverage_penalty.get(full_rho, 0.0) / checks
+            if checks else 1.0
         )
-
-        base_quality = (
-            sum(t.outcome.score for t in scored) / len(scored)
-            if scored else 0.5
-        )
-
-        # ---- SOP 触发覆盖加成（E0 确定性）：候选激活的 SOP 与近期
-        # ---- 查询的对齐度越高，预期质量加成越大。
-        sop_coverage = await self._sop_trigger_coverage(
-            candidate, sample,
-        )
-
-        judge_delta, judge_reason = 0.0, ""
-        model = judge_model or self._config.backend_model
-        if model is not None and candidate.operator != "seed":
-            judge_delta, judge_reason = await self._judge(
-                model, candidate, parent, diagnosis_summary or {},
-            )
-
         quality = max(
             0.0,
             min(
                 1.0,
-                base_quality * coverage
-                + _SOP_COVERAGE_BONUS * sop_coverage
-                + 0.15 * max(-1.0, min(1.0, judge_delta)),
+                base_quality * coverage + quality_floor,
             ),
         )
         mean_tokens = (
-            sum(est_tokens) / len(est_tokens) if est_tokens else 0.0
+            sum(est_tokens_full) / len(est_tokens_full)
+            if est_tokens_full else 0.0
         )
         denied = sum(
             1 for t in traces for p in t.permissions
             if p.behavior not in ("allow", "ALLOW")
         )
         perm_total = sum(len(t.permissions) for t in traces)
+
+        # ---- Pareto 前沿面积（空样本保持默认 1.0，旧测试兼容）----
+        if aucs:
+            pareto_auc = max(
+                0.0,
+                min(
+                    1.0,
+                    sum(aucs) / len(aucs)
+                    - parallel_penalty(
+                        k_over_n, self._config.rsi.parallel_lambda,
+                    ),
+                ),
+            )
+        else:
+            pareto_auc = 1.0
 
         objective = ObjectiveVector(
             quality=round(quality, 4),
@@ -221,7 +386,12 @@ class ReplayEvaluator:
             est_tokens_mean=round(mean_tokens, 1),
             judge_delta=round(judge_delta, 4),
             judge_reason=judge_reason,
-            details={"traces_evaluated": len(sample)},
+            details={
+                "traces_evaluated": len(sample),
+                "rho_grid": list(rho_grid),
+            },
+            pareto_auc=round(pareto_auc, 4),
+            points=points,
         )
 
     async def _sop_trigger_coverage(
@@ -264,10 +434,18 @@ class ReplayEvaluator:
         candidate: GenomeSpec,
         parent: GenomeSpec,
         diagnosis: dict[str, Any],
+        *,
+        traces: list[TraceRecord] | None = None,
     ) -> tuple[float, str]:
-        """LLM 评审：基于证据的预期质量增量。"""
+        """LLM 评审：基于**前缀**证据的预期质量增量（U3-3a）。
+
+        证据经 :func:`_prefix_view` 剥离结局分数并前置 (n,k*) 数据
+        ——评审只能看前缀统计，不能锚定绝对分数。v0 仅首轮
+        （operator=='seed'）免评，第二轮起 v0 同被 judge：公平性按
+        「全部条目同视野同评审」论证。
+        """
         evidence = {
-            "diagnosis": diagnosis,
+            "diagnosis": _prefix_view(diagnosis, traces),
             "parent": {
                 "retrieval": parent.retrieval.model_dump(),
                 "fragments": [

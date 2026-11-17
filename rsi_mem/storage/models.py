@@ -159,6 +159,11 @@ class ToolCallNode(BaseModel):
     state: Literal["ok", "error", "interrupted"] = "ok"
     latency_s: float = 0.0
     at: float = Field(default_factory=_now)
+    batch_id: str | None = None
+    """并行批次标识（U3-3a 预留：并行工具调用的分批归组）。"""
+    step_index: int | None = None
+    """录制序号（U3-3a：``TraceRecorder.add_tool_call`` 自增填入；
+    旧库 JSON 无此键照常加载为 ``None``）。"""
 
 
 class ModelCallStat(BaseModel):

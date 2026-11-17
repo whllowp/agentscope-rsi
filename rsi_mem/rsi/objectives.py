@@ -61,6 +61,29 @@ def tchebycheff(
     )
 
 
+def tprime(
+    v: ObjectiveVector,
+    weights: list[float],
+    ideal: IdealPoint,
+    uncertainty: float = 0.0,
+    uncertainty_lambda: float = 0.0,
+) -> float:
+    """U2 统一子问题度量（越小越好）：t′ = tchebycheff + λu·u。
+
+    即 Eq.7 ``J′ = J − λu·u``（J = −tchebycheff，奖励域越大越好）转
+    写到本库的距离域——距离越小越好，惩罚项必须**加**：u 越大 t′ 越
+    大越差（施工单原文的减号写在奖励域；若按字面在距离域做减法，
+    高不确定候选反而被奖励，「λu>0 压过 v0」的验收语义不可能成立）。
+
+    同一本账三处共用，无口径分歧：λ₀ 质量门、per-λ 邻域替换比较、
+    ``v0_score``/``winner_score`` 报告键。``uncertainty_lambda=0`` 时
+    退化为 :func:`tchebycheff`；v0 与无预测条目由调用方传
+    ``uncertainty=0``（已验证真实值不惩罚）。
+    """
+    t = tchebycheff(v, weights, ideal)
+    return t + uncertainty_lambda * max(0.0, uncertainty)
+
+
 def safety_from_signals(
     *,
     permission_denied: int,
@@ -81,3 +104,48 @@ def cost_efficiency(mean_est_tokens: float) -> float:
     以 2000 token 为"半效率"锚点（``1/(1+t/2000)``）。
     """
     return 1.0 / (1.0 + max(0.0, mean_est_tokens) / 2000.0)
+
+
+def pareto_frontier_auc(
+    points: list[tuple[float, float]], budget: float,
+) -> float:
+    """Eq.1 Pareto 前沿下面积（归一 [0,1]，越大越好；U3-3b）。
+
+    ``points``：归一化质量-成本点集 ``(n, a)``（n=est tokens 越小越
+    好，a=质量/池内最高分 越大越好）；``budget``：n 的归一化基准 B
+    （该轨迹 ρ=1 满预算点的 est tokens）。
+
+    非支配过滤（n 小且 a 大者胜，被支配点剔除）→ n 升序 →
+    ``AUC = Σ_j (ā_j − ā_{j−1})·(B − n̄_j)/B``（j 自第二个前沿点
+    起，步进增量 × 剩余预算比例）。单点/空集返回 0（无步进可言）。
+    """
+    if len(points) < 2 or budget <= 0.0:
+        return 0.0
+    front = [
+        (n, a) for n, a in points
+        if not any(
+            (n2 <= n and a2 > a) or (n2 < n and a2 >= a)
+            for n2, a2 in points if (n2, a2) != (n, a)
+        )
+    ]
+    if len(front) < 2:
+        return 0.0
+    front.sort(key=lambda p: p[0])  # n 升序（前沿上 a 随 n 不减）
+    auc = 0.0
+    for j in range(1, len(front)):
+        step = front[j][1] - front[j - 1][1]
+        if step <= 0.0:
+            continue
+        auc += step * max(0.0, (budget - front[j][0]) / budget)
+    return max(0.0, min(1.0, auc))
+
+
+def parallel_penalty(k_over_n: list[float], lam: float) -> float:
+    """并行度惩罚（U3-3b）：``lam·mean(k*/n)``。
+
+    ``k*/n``：串行轮数 / 总调用数（大 = 偏串行 = 罚）；``lam=0``
+    关闭（默认）。空列表返回 0。
+    """
+    if not k_over_n or lam <= 0.0:
+        return 0.0
+    return lam * (sum(k_over_n) / len(k_over_n))

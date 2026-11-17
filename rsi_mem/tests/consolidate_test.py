@@ -21,6 +21,7 @@ from rsi_mem.memory.guards import set_verification, verification_of
 from rsi_mem.rsi.tools import build_rsi_tools
 from rsi_mem.storage import (
     MemoryLink,
+    MemoryRecord,
     OutcomeRecord,
     ToolCallNode,
     TraceRecord,
@@ -416,19 +417,40 @@ async def test_middleware_prompt_shorter_after_demote(tmp_path):
         session = agent.state.session_id
         mem_mw._current_query[session] = "集群档案 环境"
         before = await mem_mw.on_system_prompt(agent, "基础提示词")
-        # core_profile 渲染条数上限 [:10]：12 条 eligible 注入 10 条
-        assert before.count("档案：属性") == 10, "前置：L3 段满额注入"
+        # core_profile 条数上限 [:10] 截 10 条后，U1 债务⑥ 的运行时
+        # 合计截断再收口：每条 display(200) 92~96 字符，预算
+        # 1200−400=800 字符 → 任意 9 条 ≥ 828 > 800、8 条恒容纳
+        # （≤768）→ 恒注入 8 条（确定性）
+        assert before.count("档案：属性") == 8, "前置：L3 段按字符合计预算注入"
 
         await ctx.consolidator.review_session(None, [])
         after = await mem_mw.on_system_prompt(agent, "基础提示词")
-        assert len(after) < len(before), "demote 后系统提示应变短"
-        assert after.count("档案：属性") < 10
+        # U1 债务⑥ 后「demote 使注入变短」的前提被运行时截断取代：
+        # 瘦身插槽与注入截断同值同口径（800 字符 + 同一贪心头部），
+        # demote 后的剩余集合恰好仍装满预算 → 条数不降反稳。改为
+        # 断言新不变量：审查前后 L3 段注入条数恒 ≤ 预算容纳数，且
+        # 段内字符合计（每条 display(200) 口径）恒 ≤ 预算。
+        budget = ctx.config.review.l3_char_budget - 400  # L3_INDEX_MARGIN
+
+        def _l3_chars(prompt: str) -> tuple[int, int]:
+            seg = prompt.split(
+                "## 核心档案（长期记忆 L3，每轮可见）", 1,
+            )[1]
+            seg = seg.split("\n\n## ", 1)[0]  # 截到下一节标题为止
+            items = [l for l in seg.splitlines() if l.startswith("- ")]
+            return len(items), sum(len(l) - 2 for l in items)
+
+        for prompt in (before, after):
+            count, chars = _l3_chars(prompt)
+            assert count <= 8 and chars <= budget, \
+                "L3 段注入恒在字符合计预算内（运行时截断兜底）"
+        assert after.count("档案：属性") <= 8
 
         demoted_ids = {
             r.id for r in await ctx.db.list_memories(tier="long", limit=50)
             if r.layer == "L1_atom" and r.title in _L3_TITLES
         }
-        assert demoted_ids
+        assert demoted_ids, "超预算的 L3 条目应被瘦身降级"
         genome = await ctx.db.active_genome()
         _block, ids = await ctx.tiers.reasoning_hint_block(
             query="细节 集群档案", session_id=None, genome=genome,
@@ -437,6 +459,101 @@ async def test_middleware_prompt_shorter_after_demote(tmp_path):
             "被降级条目应仍出现在检索注入段"
     finally:
         await ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# ⑫ U1 债务⑤：维护扫描游标轮转（link_repair 超单轮 limit 覆盖 + 扫尾重置）
+# ---------------------------------------------------------------------------
+
+async def test_link_repair_cursor_covers_beyond_single_limit(ctx):
+    """600 条带断链宿主：两轮 _propose_link_repair 合计覆盖 > 单轮 limit。
+
+    单轮 ``list_memories(limit=500)`` 只见最新 500 条，最老的 100 条
+    永远轮不到；游标轮转后第二轮扫到余量并重置，两轮并集全覆盖。
+    """
+    base = 1700000000.0
+    host_ids = set()
+    for i in range(600):
+        host = MemoryRecord(
+            tier="long", layer="L1_atom",
+            title=f"宿主{i:03d}", content="x",
+            links=[MemoryLink(target_id=f"gone-{i}", kind="related")],
+            created_at=base + i, updated_at=base + i,  # 时间戳互异
+        )
+        await ctx.db.insert_memory(host)
+        host_ids.add(host.id)
+
+    r1 = await ctx.consolidator._propose_link_repair()
+    r2 = await ctx.consolidator._propose_link_repair()
+    assert len(r1) == 500, "第一轮扫满单轮 limit"
+    assert len(r1) + len(r2) > 500, "两轮合计覆盖超单轮 limit"
+    covered = {p.memory_id for p in (*r1, *r2)}
+    assert covered == host_ids, "两轮并集应覆盖全部 600 条宿主"
+    # 第二轮扫到尾（101 < 500）→ 游标重置
+    assert await ctx.db.get_meta("scan_cursor:link_repair") == ""
+
+
+async def test_cursor_resets_after_tail_and_restarts_from_newest(ctx):
+    """limit+1 条：第二轮扫到尾后游标归位，第三轮回到最新端。"""
+    base = 1800000000.0
+    newest_id = None
+    for i in range(501):  # link_repair 单轮 limit=500
+        host = MemoryRecord(
+            tier="long", layer="L1_atom",
+            title=f"宿主{i:03d}", content="x",
+            links=[MemoryLink(target_id=f"gone-{i}", kind="related")],
+            created_at=base + i, updated_at=base + i,
+        )
+        await ctx.db.insert_memory(host)
+        if i == 500:
+            newest_id = host.id
+
+    r1 = await ctx.consolidator._propose_link_repair()
+    assert len(r1) == 500
+    assert await ctx.db.get_meta("scan_cursor:link_repair") != ""
+
+    r2 = await ctx.consolidator._propose_link_repair()
+    assert 0 < len(r2) < 500, "第二轮扫余量（并列边界行 + 最老一条）"
+    assert await ctx.db.get_meta("scan_cursor:link_repair") == "", \
+        "扫到尾后游标应重置为空（下一轮从头）"
+
+    r3 = await ctx.consolidator._propose_link_repair()
+    assert len(r3) == 500, "第三轮无游标 → 回到最新端扫满"
+    assert r3[0].memory_id == newest_id, "第三轮首批应含最新一条"
+
+
+# ---------------------------------------------------------------------------
+# ⑬ U1 债务⑤：SOP 查重精确查询——第 101 条开外的同 title 老记录也命中
+# ---------------------------------------------------------------------------
+
+async def test_sop_dedup_exact_query_beyond_list_limit(ctx):
+    """150 条 active muscle 中，同 title 老记录在最新 100 条窗口外。
+
+    旧的 ``list_memories(limit=100)`` 扫描只见最新 100 条（本例中
+    i=50..149），第 101 条开外的同 title 老记录（i=0，最老）漏判 →
+    重复 INSERT；``find_by_title`` 精确查询无窗口。
+    """
+    dup_title = "SOP: 磁盘 告警 0"
+    base = 1700000000.0
+    for i in range(150):
+        rec = MemoryRecord(
+            tier="muscle", kind="sop",
+            title=dup_title if i == 0 else f"其他SOP{i:03d}",
+            content="x",
+            created_at=base + i, updated_at=base + i,
+        )
+        await ctx.db.insert_memory(rec)
+
+    traces = []
+    for _ in range(3):
+        t = TraceRecord(session_id="s1", query="磁盘 告警 0")
+        t.tool_calls = [
+            ToolCallNode(name="bash", input_digest="df -h", state="ok"),
+            ToolCallNode(name="read_file", input_digest="l", state="ok"),
+        ]
+        traces.append(t)
+    assert await ctx.consolidator._distill_sop("s1", traces) is None, \
+        "窗口外的同 title 老记录也应被精确查重命中（不重复提议）"
 
 
 # ---------------------------------------------------------------------------

@@ -83,11 +83,24 @@ class RSIConfig(BaseModel):
     """每轮 dream 的候选数（含当前基因组 v0，保证非退化）。"""
     subproblems: list[list[float]] = Field(
         default_factory=lambda: [
-            [0.7, 0.2, 0.1],  # 质量优先
-            [0.2, 0.7, 0.1],  # 成本优先
+            [0.7, 0.2, 0.1],  # 质量优先（λ₀：质量门/部署口径）
+            [0.2, 0.7, 0.1],  # 成本优先（[1] 随 U2 per-λ incumbent 激活）
         ],
     )
-    """多目标权重向量（质量/成本效率/安全）——Harmony 的 MOEA/D 子问题。"""
+    """多目标权重向量（质量/成本效率/安全）——Harmony 的 MOEA/D 子问题。
+
+    U2 起每个 λ 维护独立 incumbent（邻域替换，``replace_cap`` 封顶）；
+    λ₀ 兼任质量门与部署口径（t′/report 键），[1] 等其余子问题经
+    incumbent 池参与跨轮演化。
+    """
+    uncertainty_lambda: float = Field(default=0.0, ge=0.0)
+    """Eq.7 λ_d：t′ = tchebycheff − λu·u 的不确定性惩罚系数。
+
+    0 = 关闭（t′ 退化为纯 Tchebycheff）；>0 时预测不确定性高的候选
+    在所有 λ 的子问题度量上被压低（v0 的 u ≡ 0——已验证真实值不惩罚）。
+    """
+    replace_cap: int = Field(default=2, ge=1)
+    """MOEA/D 邻域替换上限 nr：单个候选至多替换的 incumbent 数。"""
     regression_traces: int = Field(default=5, ge=1, le=20)
     """回放评估时抽查的近期成功轨迹条数（回归保障）。"""
     plugins: list[str] = Field(default_factory=list)
@@ -99,6 +112,17 @@ class RSIConfig(BaseModel):
     predictor_mae_threshold: float = Field(default=0.25, ge=0.05, le=1.0)
     """预测平均绝对误差超过该值且样本足够 → 进入保守模式
     （只允许 retrieval_evolve 候选），直至预测重新校准。"""
+    rho_grid: list[float] = Field(
+        default_factory=lambda: [0.0, 0.25, 0.5, 0.75, 1.0],
+    )
+    """回放预算扫描网格（U3-3b）：ρ=0 最小预算（top_k=1 /
+    char_budget=200）→ ρ=1 候选满预算；threshold 不插值。"""
+    pareto_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    """排序键质量混合系数（U3-3b）：q′=(1−α)·quality+α·pareto_auc，
+    对全候选（含 v0）一致计算；0 = 回退旧行为（纯 quality）。"""
+    parallel_lambda: float = Field(default=0.0, ge=0.0)
+    """并行度惩罚系数（U3-3b）：V = mean(AUC) − λ·mean(k*/n)。默认 0
+    ——现网轨迹串行、k*/n 区分度弱，接口就位不硬凑。"""
 
 
 class TelemetryConfig(BaseModel):

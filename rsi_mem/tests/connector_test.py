@@ -106,9 +106,9 @@ async def test_http_proxy_wires_used_ids_and_consolidation(
     fake = _FakeUpstream()
     monkeypatch.setattr(proxy_mod, "_CTX", ctx)
     monkeypatch.setattr(proxy_mod, "_CLIENT", fake)
-    monkeypatch.setattr(proxy_mod, "_PROXY_TURNS", 0)
     try:
         # 注入前缀与 ids 一起返回（ids 即注入清单）
+        # （回合计数已改为 DB meta 原子自增，无需重置进程内变量）
         prefix, ids = await proxy_mod._build_memory_prefix(
             "生产集群是什么架构",
         )
@@ -272,4 +272,95 @@ async def test_build_ops_agent_with_mock(tmp_path):
         assert len(traces) == 1
         shorts = await ctx.db.list_memories(tier="short", limit=10)
         assert shorts
+        await ctx.close()
+
+
+# ---------------------------------------------------------------------------
+# U1 债务⑥④：L3 段运行时合计截断（字符合计口径）+ 回合计数原子落 meta
+# ---------------------------------------------------------------------------
+
+async def test_proxy_prefix_l3_chars_budget_and_index_unit(
+    tmp_path, monkeypatch,
+):
+    """L3 段注入字符合计 ≤ 预算（超量截断）、索引段字符口径。"""
+    from rsi_mem.memory.guards import set_verification
+    from rsi_mem.memory.tiers import L3_INDEX_MARGIN
+
+    from .consolidate_test import _L3_TITLES
+
+    config = RSIMemConfig(data_dir=str(tmp_path / "proxy_u1_l3"))
+    config.proxy.upstream_base_url = "https://upstream.example.com"
+    config.proxy.upstream_api_key = "sk-test"
+    ctx = RSIMemContext(config)
+    l3_ids = []
+    try:
+        for i, title in enumerate(_L3_TITLES):
+            rec = await ctx.tiers.longterm.add(
+                title=title, layer="L3_core",
+                content=f"{title}：属性{i}：值{i}。" + "细节" * 30,
+            )
+            l3_ids.append(rec.id)
+        # trace_verified：l3_eligible 准入（12 条全部可注入）
+        for m in await ctx.db.list_memories(
+            tier="long", layer="L3_core", limit=30,
+        ):
+            set_verification(m, "trace_verified", ["trace:tseed"])
+            await ctx.db.update_memory(m)
+        # L1 条目供索引段成簇
+        await ctx.tiers.longterm.add(title="k8s 档案", content="etcd 三节点。")
+
+        monkeypatch.setattr(proxy_mod, "_CTX", ctx)
+        monkeypatch.setattr(proxy_mod, "_CLIENT", _FakeUpstream())
+        prefix, ids = await proxy_mod._build_memory_prefix("生产集群")
+
+        budget = config.review.l3_char_budget - L3_INDEX_MARGIN
+        seg = prefix.split("## 核心档案（长期记忆 L3，每轮可见）", 1)[1]
+        l3_items = [
+            l for l in seg.split("\n\n## ", 1)[0].splitlines()
+            if l.startswith("- ")
+        ]
+        # 每条 display(200) 92~96 字符、预算 800：任意 9 条 ≥ 828 超
+        # 预算、8 条恒容纳 → 恰注入 8 条（12 条 eligible 被截断）
+        assert len(l3_items) == 8, "超量截断：12 条 eligible 只注入预算容纳数"
+        assert sum(len(l) - 2 for l in l3_items) <= budget, \
+            "L3 段字符合计 ≤ l3_char_budget − L3_INDEX_MARGIN"
+        injected_l3 = set(ids) & set(l3_ids)
+        assert len(injected_l3) == 8, "被截断条目不入注入 ids"
+
+        # 索引段字符口径 ≤ L3_INDEX_MARGIN（与 L3 段同一合计预算）
+        start = prefix.index("## 记忆索引")
+        end = prefix.find("\n\n## ", start)
+        index_section = prefix[start:] if end < 0 else prefix[start:end]
+        body = "\n".join(
+            l for l in index_section.splitlines()
+            if l != "更多用 memory_search 检索"
+        )
+        assert len(body) <= L3_INDEX_MARGIN, "索引段按字符口径计量"
+    finally:
+        await ctx.close()
+
+
+async def test_proxy_turn_counter_in_meta(tmp_path, monkeypatch):
+    """U1 债务④：连续 3 次 _save_trace 后 meta['proxy_turns'] == '3'。
+
+    计数由 ``bump_meta`` 单 locked 段原子自增（替代进程内
+    ``_PROXY_TURNS`` 变量的丢更新窗口），多 worker 经 WAL 合并。
+    """
+    config = RSIMemConfig(data_dir=str(tmp_path / "proxy_u1_turns"))
+    config.proxy.upstream_base_url = "https://upstream.example.com"
+    config.proxy.upstream_api_key = "sk-test"
+    ctx = RSIMemContext(config)
+    fake = _FakeUpstream()
+    monkeypatch.setattr(proxy_mod, "_CTX", ctx)
+    monkeypatch.setattr(proxy_mod, "_CLIENT", fake)
+    try:
+        for i in range(3):
+            resp = await fake.post("u", json={})
+            await proxy_mod._save_trace(
+                ctx, f"生产集群 {i}", {}, "mock 答复",
+                time.perf_counter(), [],
+            )
+        assert await ctx.db.get_meta("proxy_turns") == "3", \
+            "回合计数应原子落 meta 键 proxy_turns"
+    finally:
         await ctx.close()
