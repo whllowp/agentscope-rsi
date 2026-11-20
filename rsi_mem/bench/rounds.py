@@ -25,28 +25,16 @@ import time
 from typing import Any
 
 from ..context import RSIMemContext
+from ..rsi.golden import GOLDEN_KNOWLEDGE as _KNOWLEDGE
+from ..rsi.golden import GOLDEN_SCENARIOS as SCENARIOS
 from ..storage import (
     ModelCallStat,
     OutcomeRecord,
     ToolCallNode,
     TraceRecord,
 )
-
-SCENARIOS: list[dict[str, str]] = [
-    {"query": "线上磁盘使用率 95% 告警怎么处理", "kw": "磁盘"},
-    {"query": "redis 内存告警不断触发", "kw": "redis"},
-    {"query": "k8s pod 反复 crashloop", "kw": "crashloop"},
-    {"query": "证书还有 3 天到期", "kw": "证书"},
-    {"query": "数据库连接池耗尽", "kw": "连接池"},
-]
-
-_KNOWLEDGE = {
-    "磁盘": "磁盘满先 du -sh 定位大文件，清日志前确认轮转策略。",
-    "redis": "redis 内存高先查 maxmemory 与淘汰策略，再看待淘汰键。",
-    "crashloop": "crashloop 先 describe pod 看 events，再查日志退出码。",
-    "证书": "证书到期用 openssl x509 -noout -enddate 核对，提前 7 天换。",
-    "连接池": "连接池耗尽先看慢查询与泄漏，再调 pool_max 小步放大。",
-}
+# U2：场景与黄金知识原值冻结到 rsi/golden.py（leaf 模块，执行门共用，
+# 单一事实源）；此处别名保持 bench 内符号兼容。
 
 
 class OpsEnv:
@@ -162,8 +150,18 @@ async def run_bench(
     traces_per_round: int = 4,
     seed: int = 42,
 ) -> dict[str, Any]:
-    """跑 ``rounds`` 轮 benchmark，返回报告并落盘。"""
-    env = OpsEnv(ctx, seed=seed)
+    """跑 ``rounds`` 轮 benchmark，返回报告并落盘。
+
+    **治理契约（U4）**：``ctx`` 传入时治理断路器参数已在**构造期**
+    定型——bench 需要宽松治理（构造期传入 ``governance=
+    GovernanceConfig(max_deploys_per_hour=10**6, min_deploy_interval_s
+    =0.0, consecutive_deploy_limit=10**6)``，见 cli bench 分支与
+    bench 测试）。默认严格治理（6 次/小时 + 300s 冷却）会使 deploys
+    被限流，此时 ``rows[0]["governor_state"]`` 可见原因而非静默
+    ``deploys=0``。签名不变；构造后覆盖只能走整字段重赋值旁路，
+    不支持也不承诺。
+    """
+    env = OpsEnv(ctx, seed=42)
     await env.seed_knowledge()
 
     rows: list[dict[str, Any]] = []
@@ -174,7 +172,7 @@ async def run_bench(
         dream = await ctx.engine.dream(trigger=f"bench:{r}")
         genome_after = await ctx.db.active_genome()
         q_after = await env.genome_quality(genome_after)
-        rows.append({
+        row = {
             "round": r,
             "version_before": genome_before.version,
             "version_after": genome_after.version,
@@ -195,7 +193,16 @@ async def run_bench(
                 else dream.get("pareto_auc_v0")
             ),
             "selector": dream.get("selector"),
-        })
+            # U4 治理/执行门观测
+            "execution_gate": (
+                (dream.get("execution_gate") or {}).get("passed")
+            ),
+            "governor": dream.get("governor_decision"),
+        }
+        if r == 1:
+            # 首轮快照治理器状态（调用方忘传宽松治理时原因可见）
+            row["governor_state"] = ctx.engine._governor.snapshot()
+        rows.append(row)
 
     first, last = rows[0], rows[-1]
     predictions = await ctx.db.load_predictions()
@@ -229,6 +236,14 @@ async def run_bench(
             "balanced_deploys": sum(
                 1 for x in rows
                 if x["deployed"] and x.get("selector") == "balanced"
+            ),
+            # U4 治理/执行门统计（只增不改：旧键名与语义原样）
+            "execution_gate_passes": sum(
+                1 for x in rows if x["execution_gate"] is True
+            ),
+            "governor_denies": sum(
+                1 for x in rows
+                if (x.get("governor") or {}).get("allowed") is False
             ),
         },
     }

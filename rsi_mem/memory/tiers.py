@@ -15,7 +15,7 @@ from typing import Any
 
 from agentscope._logging import logger
 
-from ..config import RSIMemConfig
+from ..config import RSIMemConfig, ReviewConfig
 from ..storage import (
     GenomeSpec,
     MemoryLink,
@@ -46,8 +46,18 @@ _DANGEROUS_PATTERNS = (
 
 L3_INDEX_MARGIN = 400
 """L3 合计预算中的 U4 索引段预留余量（合计口径 = L3 段 + U4 索引段 ≤
-``l3_char_budget``）。U3 瘦身插槽与 U4 注入路径共用本常量，防止两处
-口径漂移。"""
+``l3_char_budget``）。U3 瘦身插槽与 U4 注入路径共用
+:func:`effective_l3_budget` 计算实际预算，防止两处口径漂移。"""
+
+
+def effective_l3_budget(review_cfg: ReviewConfig) -> int:
+    """L3 段实际字符预算（纯函数）：max(l3_char_budget − 余量, 0)。
+
+    统一 U4 注入路径运行时截断与 U3 瘦身插槽两处的预算口径。配置层
+    ``ge=600``（= 400 余量 + 200 最小注入）保证正常路径恒 ≥200；钳 0
+    仅是防御（手改常量等异常态下不至于负预算把截断退化成恒留 1 条）。
+    """
+    return max(review_cfg.l3_char_budget - L3_INDEX_MARGIN, 0)
 
 
 class TierManager:
@@ -88,7 +98,8 @@ class TierManager:
         过滤 + **运行时合计截断**）+ 顶部小索引 + 命中反射 —— 同一
         ``l3_char_budget`` 合计预算（索引段字符在 ``L3_INDEX_MARGIN``
         余量内）。L3 段运行时截断与 U3 瘦身插槽同值同口径（字符）：
-        预算 ``l3_char_budget − L3_INDEX_MARGIN``，超限按
+        预算 :func:`effective_l3_budget`（= l3_char_budget −
+        ``L3_INDEX_MARGIN``，下限钳 0），超限按
         (trace_verified, hit_count) 排序保留头部 —— 瘦身提案降级的是
         库内条目，截断兜底的是两次审查之间的注入面（U1 债务⑥）。
 
@@ -106,9 +117,7 @@ class TierManager:
             core = await self.retriever.core_profile()
             if core:
                 sections.append("## 核心档案（长期记忆 L3，每轮可见）")
-                budget = (
-                    self._config.review.l3_char_budget - L3_INDEX_MARGIN
-                )
+                budget = effective_l3_budget(self._config.review)
                 ranked = sorted(
                     core,
                     key=lambda c: (

@@ -49,7 +49,7 @@ python -m rsi_mem.demo.main --backend dashscope --model qwen3.7-max
 export OPENAI_API_KEY=... OPENAI_BASE_URL=https://.../v1
 python -m rsi_mem.demo.main --backend openai --model gpt-4o
 
-# 测试（124 个，全部离线）
+# 测试（161 个，全部离线）
 python -m pytest rsi_mem/tests -q
 ```
 
@@ -149,7 +149,9 @@ app = create_app(..., extra_agent_middlewares=build_middleware_factory())
 
 v3 引擎深化（MOEA/D 邻域替换与平衡部署、不确定性惩罚选择、ρ 扫描
 Pareto 评分、前缀盲评防泄漏、债务清偿）的逐机制数学定义与接缝文件见
-[docs/rsi-engine-v3-design.md](docs/rsi-engine-v3-design.md)。
+[docs/rsi-engine-v3-design.md](docs/rsi-engine-v3-design.md)；本轮
+「可信自改进」升级（执行反馈级验证 / 失败模式防御三件套 / 治理断路器
+与 L1-L5 自评）见 [docs/trusted-rsi-design.md](docs/trusted-rsi-design.md)。
 
 | 论文机制 | 实现 |
 |---|---|
@@ -169,6 +171,14 @@ Pareto 评分、前缀盲评防泄漏、债务清偿）的逐机制数学定义�
 | **RSI-Anything：域适配器插件化** | `rsi/plugins.py` —— 计划生成收敛到 `PluginRegistry`，内置改进器也只是插件；第三方经 `rsi.plugins=["pkg:Plugin"]` 或 entry points `rsi_mem.plugins` 注入，**无法绕过校验与非退化门** |
 | 论文 Eq.1：ρ 扫描 Pareto 评分 | 回放对每条轨迹按 `rho_grid`（默认 5 档）插值 top_k/char_budget，得归一化质量-成本点 (n,a)，非支配过滤后算前沿下面积 `pareto_auc`（−并行度惩罚 λ∥·k\*/n）；经 `pareto_alpha` 混入排序目标 q′=(1−α)·quality+α·AUC（ideal 同空间维护，α=0 回退旧行为） |
 | 论文附录 D.2：prefix-only 防泄漏 | 评审（judge）证据为**前缀视图**：剥离结局分数（`mean_outcome`/`worst·best_traces[].score`），前置前 5 步工具序列与 (n,k\*) 数据；v0 第二轮起同被评审（同视野公平），评审每候选一次不随 ρ 放大；诊断全量数据仍留给策略侧 |
+| **Trusted-RSI U2：执行反馈级验证门** | validator 保证结构合法、pair gate 复验组装态，但都不执行——`rsi/execution_gate.py` 在**隔离栈**（临时目录全新 DB/Mirror/Tiers，不建 context）上对胜者做三类硬断言：①**必注入**（5 个黄金场景 query 渲染 system prompt，父代锁定片段 text 逐字在场）；②**必召回**（kw 探针 + 胜者检索参数下黄金知识必须命中——实证整 query 对磁盘/证书场景 FTS 零 3-gram 交集，故用关键词探针；语义=「检索参数不杀关键词召回」）；③**必守预算**（渲染 ≤ `governance.max_inject_chars` 绝对臂，不设相对臂防误杀内容增量）。O(1) 只验胜者，v0 获胜豁免；被拒走 pair-gate 同款路径并驱逐 incumbent 槽位（防重入死循环）。黄金数据冻结在 `rsi/golden.py`（leaf 模块防环，bench 同源） |
+| **Trusted-RSI U2：锁定片段全字段锁** | `rsi/validator.py` 完整性段按 `(text, enabled, slot, triggers)` 四元组逐字段比对——旧版只比 text，`enabled=False`/`slot=reflex` 可让锁定片段静默退出渲染面而校验照过；与执行门必注入断言双保险 |
+| **Trusted-RSI U2：证据层级感知选择（E2 双门）** | `rsi/replay.py` 额外产出 `quality_e2`（剥掉 `0.15×judge_delta` 的 E1 分量，只留 base×coverage + SOP 触发覆盖）；部署门从 G 升级为 G∩G′（E1 口径与 E2 口径两道 λ₀ Tchebycheff 门都不得劣于 v0）——**仅 LLM 评审（E1）支持的质量优势不得越过 E2/E0 门**；judge 缺席时双门退化单门，行为不变；v0 两门恒属 ⇒ 非退化不变 |
+| **Trusted-RSI U3：自证回路防御** | 预测回填行强制 `source` 分类学：同轮回放标 `replay`（E2 自产）、部署后真实轨迹标 `production`（E3 外部）；`rsi/predictor.py` 加载层过滤 production 行（世界模型不拿部署后分数自校准，跨重启成立）；doctor 三哨兵：预测器自参考（近 20 条 realized 无 production + 冷启动豁免）、评审未激活（judge_delta_mean 恒 0，曾激活后沉默才 warn）、外部信号消失（全自产 info） |
+| **Trusted-RSI U3：多样性坍缩防御** | 连续同算子部署 ≥3 轮 → dream 注入有界随机 `retrieval_evolve` 扰动候选（origin="explore"，种子可复现、走全部校验/回放/双门，v0 保护不变）；doctor 哨兵：近 10 版同算子 >80% warn、相邻版本去元数据哈希相同（空演化漂移）warn |
+| **Trusted-RSI U3：帧锁定审计** | 部署基因组 `scores["render_hash"]`=sha256(fragment_text())[:16]——渲染面指纹（内容增量才移动）；doctor「外部审计包」输出近 6 版 render_hash/operator/部署斜率供人定期复核 |
+| **Trusted-RSI U4：治理断路器（独立于 RSI 可改对象）** | `governor.py` 刻意站在 RSI 可改对象之外：参数在 `RSIEngine` 构造期从 frozen `GovernanceConfig` **值拷贝快照**（整字段重赋值旁路无效，且 context 构造链早于一切 plugin.start）；状态在 `data_dir/governor.json` 原子写而非插件可写的 meta 表；人工干预只有手工编辑该文件或 `RSI_MEM_GOVERNOR_PIN`。`check_deploy` 四查：fail-closed / 暂停 / 钉住 / 速率(6/h)+冷却(300s)+连续上限(8→自动暂停)；质量回归规则（部署后 20 条均值下滑 >0.1 且样本 ≥5）→ 自动回滚+暂停+审计事件；状态损坏**或被删**一律 fail-closed 拒部署，修复后从现状续算。rollback 是恢复动作不被拦，但有内检（pin 拒 + 目标版复验拒 dangling SOP） |
+| **Trusted-RSI U4：L1-L5 分级自评** | `rsi/level.py` 对齐公开 RSI 能级榜单判据的诚实快照：三项自主（提出/部署/回放验证）全真 → **L3**；`verify_executed` 双源取证（CAT_DREAM 事件 ∪ 基因组 scores 的 execution_gate 标，末轮未部署不抹历史）；`imp_mutable`（基因组不覆盖引擎超参）与 `domain_generality`（黄金场景单域）如实卡在 L4/L5 外落进 failing 列表——**当前满分快照 = L3 + failing=[imp_mutable, domain_generality]，evidence=E0**；dream 报告挂 `level_assessment` 段、doctor 输出 |
 
 **演化对象是声明式基因组**（`GenomeSpec`：提示词片段 + 检索参数 + 激活
 SOP 集），不是任意代码——这是"不改动源码"约束下的安全演化边界。RSI
@@ -184,6 +194,8 @@ SOP 集），不是任意代码——这是"不改动源码"约束下的安全�
 ```
 <data_dir>/                # 默认 <workdir>/.rsi_mem，或 RSI_MEM_HOME
 ├── memory.db              # SQLite（WAL + FTS5）：记忆/轨迹/基因组/待确认
+├── governor.json          # 治理断路器状态（U4：独立于 meta 表，原子写；
+│                          #  部署/回滚账本 + pause/pin，人工干预唯一入口）
 └── mirror/
     ├── muscle/<name>/SKILL.md   # 肌肉记忆镜像（兼容 LocalSkillLoader，
     │                            #  demo 已自动挂为技能目录）
@@ -222,6 +234,12 @@ RSIMemConfig(
              uncertainty_lambda=0.0,  # t′ = tchebycheff + λu·u（0 关闭）
              rho_grid=[0.0, 0.25, 0.5, 0.75, 1.0],  # ρ 预算扫描
              pareto_alpha=0.5),       # q′=(1−α)·quality+α·pareto_auc
+    governance=dict(               # 治理断路器（frozen；构造期快照生效）
+        max_inject_chars=12000,      # 执行门绝对注入预算
+        max_deploys_per_hour=6, min_deploy_interval_s=300.0,
+        consecutive_deploy_limit=8,  # 触顶自动暂停部署
+        quality_rollback_window=20, quality_rollback_drop=0.1,
+        min_traces_after_deploy=5),  # 质量回归判定最少样本
     backend_model=None,             # 后台 LLM（None=复用 Agent 主模型）
     embedding_model=None,           # 可选向量检索
 )
@@ -238,7 +256,7 @@ RSIMemConfig(
 ## 测试
 
 ```bash
-python -m pytest rsi_mem/tests -q   # 124 个用例，全部离线
+python -m pytest rsi_mem/tests -q   # 161 个用例，全部离线
 ```
 
 覆盖：FTS 中文检索、TTL/LRU、链接展开、晋升溯源、分级确认、SOP 蒸馏、
@@ -259,4 +277,12 @@ l3 准入不看 confidence、矛盾互插旗标）**、**固化管线四插槽�
 分数剥离、(n,k\*) 前置、评审调用不随 ρ 放大）**、**doctor 子问题覆盖
 与 Pareto 退化哨兵**，以及 U1 债务①-⑥ 清偿（merge 锚点/断链预过滤/
 空拆分语义/后台任务强引用与原子计数/游标扫描与精确查重/注入面截断
-兜底）。
+兜底）；本轮可信自改进新增：**执行级验证门（全字段锁/kw 探针真命中/
+锁定片段必注入/绝对预算臂/隔离栈无泄漏/拒绝驱逐 incumbent/门绿端到端
+部署/预算快照免疫重赋值/黄金数据单源）**、**E2 双门（quality_e2 剥
+E1 分量）**、**失败模式防御三件套（E3 production/replay 回填分类与
+跨重启过滤/冷启动豁免的自参考哨兵/评审哨兵/分布监测/探索注入确定性
+与触发/算子集中度/render_hash 审计包）**、**治理断路器（速率/冷却/
+连续上限暂停/质量回归自动回滚/pin/fail-closed 损坏与删除/构造期快照
+免疫/回滚复验/bench 宽松治理契约）**、**L1-L5 自评（事件历史双源
+verify_executed + L3 诚实输出 + 空库 L1）**。

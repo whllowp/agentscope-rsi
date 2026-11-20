@@ -24,8 +24,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
+import random
 import time
+from collections import Counter
 from dataclasses import replace
 from typing import Any
 
@@ -33,19 +37,23 @@ from agentscope._logging import logger
 from agentscope.model import ChatModelBase
 
 from ..config import RSIMemConfig
+from ..governor import Governor, GovernorDecision
 from ..memory.tiers import TierManager
-from ..storage import GenomeSpec, RSIMemDatabase
+from ..storage import GenomeSpec, RSIMemDatabase, TraceRecord
 from ..telemetry import (
     CAT_DREAM,
+    CAT_ERROR,
     CAT_PREDICTION,
     LangfuseBridge,
     LocalEventLog,
     NOOP_BRIDGE,
 )
 from .evidence import annotate_diagnosis, evidence_legend, tag_evidence
+from .execution_gate import run_execution_gate
 from .improver import Improver
+from .level import assess, collect
 from .objectives import IdealPoint, ObjectiveVector, tprime
-from .operators import MutationOutcome, apply_plan
+from .operators import MutationOutcome, OperatorPlan, apply_plan
 from .plugins import PluginRegistry, build_default_registry
 from .predictor import (
     CandidateFeatures,
@@ -67,6 +75,7 @@ _REPORT_EVIDENCE = {
     "pareto_auc": 2,
     "per_lambda_incumbents": 2,
     "uncertainty": 1,
+    "execution_gate": 2,
 }
 
 
@@ -99,6 +108,20 @@ class RSIEngine:
         self._dream_lock = asyncio.Lock()
         self._dreaming = False
         self._traces_since_dream = 0
+        # U4 治理断路器：**构造期**建立——参数自 config.governance 值
+        # 拷贝快照（此后整字段重赋值 ctx.config.governance 不影响本实
+        # 例，插件无法松动断路器）；状态在 data_dir/governor.json（非
+        # 插件可写的 meta 表）。context 构造链（context.py）早于一切
+        # plugin.start（首个 dream 才懒启动），故快照先于任何插件代码。
+        self._governor = Governor(
+            config.governance,
+            state_path=os.path.join(config.data_dir, "governor.json"),
+        )
+        # 执行门注入预算同规则快照：max_inject_chars 也属治理参数，
+        # 插件在 start(ctx) 里整字段重赋值 config.governance 放行
+        # （pydantic 只拦属性突变），门若运行期读活配置即被旁路——
+        # 构造期取值后恒以快照传给 run_execution_gate。
+        self._max_inject_chars = config.governance.max_inject_chars
         # 后台 dream 任务的强引用（U1 债务④）：事件循环只持弱引用，
         # 不存引用会被 GC 中途回收；done 回调即移除
         self._bg_tasks: set[asyncio.Task] = set()
@@ -167,6 +190,17 @@ class RSIEngine:
             await self.dream(trigger="auto" if auto else "manual")
         except Exception as e:  # noqa: BLE001
             logger.warning("RSI dream failed: %s", e)
+            # U3：后台 dream 失败必须可观测（此前仅 logger.warning，
+            # events.jsonl 里静默消失）
+            await self._emit(
+                CAT_ERROR,
+                {
+                    "scope": "dream",
+                    "trigger": "auto" if auto else "manual",
+                    "error": f"{type(e).__name__}: {e}",
+                },
+                level="warn",
+            )
         finally:
             self._dreaming = False
 
@@ -189,6 +223,119 @@ class RSIEngine:
     # ------------------------------------------------------------------
     # dream 主流程
     # ------------------------------------------------------------------
+    async def _backfill_e3(
+        self, traces: list[TraceRecord], current: GenomeSpec,
+    ) -> None:
+        """U3 E3 回填：用部署后真实轨迹结算 winner 的 pending 预测。
+
+        自证回路观测面的另一半：部署时记 pending（genome_version 锚
+        定），此处用**真实外部信号**（production 轨迹）回填
+        ``realized``（source="production"；同轮回放回填为 "replay"）。
+        realized = mean(post-deploy score) − mean(pre-deploy window
+        score)，cost/safety 置 0（轨迹分数只承载质量信号）。部署后
+        样本 <5 或无部署前窗口 → 保持 pending（下轮再试）。
+
+        production 行不进 predictor 在线统计（``_ensure_loaded``
+        加载层过滤，跨重启成立）。
+        """
+        if current.version == 0:
+            return  # 种子版：无「部署」可言
+        try:
+            preds = await self._db.load_predictions(realized_only=False)
+        except Exception:  # noqa: BLE001 — 兼容空库
+            return
+        pending = [
+            p for p in preds
+            if p["genome_version"] == current.version
+            and p["realized"] is None
+        ]
+        if not pending:
+            return
+
+        def _at(t: TraceRecord) -> float:
+            return t.finished_at or t.started_at
+
+        post = [
+            t for t in traces
+            if t.outcome is not None and _at(t) >= current.created_at
+        ]
+        pre = [
+            t for t in traces
+            if t.outcome is not None and _at(t) < current.created_at
+        ]
+        if len(post) < _E3_MIN_POST_SAMPLES or not pre:
+            return  # 样本不足：保持 pending
+        mean_post = sum(t.outcome.score for t in post) / len(post)
+        mean_pre = sum(t.outcome.score for t in pre) / len(pre)
+        realized = {
+            "quality_delta": round(mean_post - mean_pre, 4),
+            "cost_eff_delta": 0.0,
+            "safety_delta": 0.0,
+            "source": "production",
+        }
+        for p in pending:
+            await backfill_realized(
+                self._db, prediction_id=p["id"], realized=realized,
+            )
+
+    async def _governed_quality_check(
+        self, traces: list[TraceRecord], current: GenomeSpec,
+    ) -> GenomeSpec:
+        """U4 治理质量规则：部署后真实质量回归 → 自动回滚 + 暂停。
+
+        近 ``quality_rollback_window`` 条部署后带结局轨迹均值较部署前
+        窗口均值下滑 > ``quality_rollback_drop``（且部署后样本 ≥
+        ``min_traces_after_deploy``）→ 调 :meth:`rollback`（其内部有
+        pin/复验防线，被拒则不回滚不暂停）并置 deployment_pause。
+        回滚成功则返回新 current，本轮 dream 按回滚后基线继续。
+        """
+        if current.version == 0 or current.operator in ("seed",
+                                                        "rollback"):
+            return current
+
+        def _at(t: TraceRecord) -> float:
+            return t.finished_at or t.started_at
+
+        post = [
+            t for t in traces
+            if t.outcome is not None and _at(t) >= current.created_at
+        ]
+        pre = [
+            t for t in traces
+            if t.outcome is not None and _at(t) < current.created_at
+        ]
+        if not pre:
+            return current
+        decision = self._governor.check_quality_regression(
+            [t.outcome.score for t in post],
+            sum(t.outcome.score for t in pre) / len(pre),
+        )
+        if decision.allowed:
+            return current
+        rolled = await self.rollback()
+        if rolled is None:
+            logger.warning(
+                "governor quality regression detected but rollback "
+                "refused: %s", decision.reason,
+            )
+            return current
+        self._governor.note_rollback(time.time(), rolled.version)
+        self._governor.pause_deployments(
+            f"quality regression on v{current.version}: "
+            f"{decision.reason}",
+        )
+        await self._emit(
+            CAT_ERROR,
+            {
+                "scope": "governor",
+                "kind": "quality_rollback",
+                "from_version": current.version,
+                "to_version": rolled.version,
+                "reason": decision.reason,
+            },
+            level="warn",
+        )
+        return rolled
     async def dream(
         self,
         *,
@@ -206,6 +353,11 @@ class RSIEngine:
             await self.predictor._ensure_loaded()
             traces = await self._db.list_traces(limit=100)
             current = await self._db.active_genome()
+            # ---- 0. E3 回填（U3 自证回路观测面）：部署后真实轨迹结算 ----
+            await self._backfill_e3(traces, current)
+            # ---- 0b. 治理质量规则（U4）：部署后质量回归 → 自动回滚+暂停
+            #      （bench 的 non_degraded 逻辑搬进运行时）----
+            current = await self._governed_quality_check(traces, current)
             await self._emit(
                 CAT_DREAM,
                 {"phase": "start", "trigger": trigger,
@@ -240,6 +392,19 @@ class RSIEngine:
                         plan.operator,
                     ):
                         dropped_by_gate += 1
+                        # U3：保守模式丢弃此前只计数——现在落 CAT_ERROR
+                        # 级 audit（可观测的截断行为）
+                        await self._emit(
+                            CAT_ERROR,
+                            {
+                                "scope": "conservative_gate",
+                                "kind": "audit",
+                                "operator": plan.operator,
+                                "plugin": plugin_name,
+                                "reason": "预测器不可靠期间丢弃非保守算子",
+                            },
+                            level="warn",
+                        )
                         continue
                     outcome = await apply_plan(
                         current, plan, self._tiers,
@@ -258,6 +423,20 @@ class RSIEngine:
                                 "candidate rejected by validator: %s",
                                 report,
                             )
+                            # U3：校验拒绝此前仅 logger.info——落 audit 事件
+                            await self._emit(
+                                CAT_ERROR,
+                                {
+                                    "scope": "validator",
+                                    "kind": "audit",
+                                    "operator": outcome.genome.operator,
+                                    "stage": report.stage,
+                                    "reason": "; ".join(
+                                        report.problems,
+                                    )[:200],
+                                },
+                                level="warn",
+                            )
                             for sop in outcome.sop_candidates:
                                 await self._tiers.muscle.archive(sop.id)
                             continue
@@ -267,17 +446,22 @@ class RSIEngine:
                     )
 
             # ---- 2b. MOEA/D incumbent 恢复（U2）：跨轮 per-λ 记忆 ----
-            # meta 'rsi_moead_incumbents' 只存 {λ 索引: {spec_json,
-            # objectives, dream_seq}}（【P1】不存 t 值——t′ 每轮在当前
-            # ideal 下重算，杜绝旧值过门破非退化）。逐 λ 校验：失败
-            # （含引用 SOP 已被上轮归档）丢弃该 λ incumbent 并重置为
-            # v0；通过且 ≠ current 的作为 entries 追加项（origin=
-            # 'incumbent:<i>'，不占 candidates 预算；outcomes 为空 ⇒
-            # 无 sop_candidates，落选归档循环对其无操作）进本轮重评。
+            # meta 'rsi_moead_incumbents' 存 {λ 索引: {spec_json,
+            # objectives, dream_seq, wins, last_restore}}（【P1】不存
+            # t 值——t′ 每轮在当前 ideal 下重算，杜绝旧值过门破非退化；
+            # wins = 该 λ 历史邻域替换胜出累计、last_restore = 最近一次
+            # 恢复结局，二者是 doctor 证据制哨兵的数据源——restore 失败
+            # （dropped:*/corrupt）才是机制失效证据，wins 只区分 info
+            # 语气）。逐 λ 校验：失败（含引用 SOP 已被上轮归档）丢弃该
+            # λ incumbent 并重置为 v0；通过且 ≠ current 的作为 entries
+            # 追加项（origin='incumbent:<i>'，不占 candidates 预算；
+            # outcomes 为空 ⇒ 无 sop_candidates，落选归档循环对其无
+            # 操作）进本轮重评。
             dream_seq = await self._db.bump_meta("dream_seq")
             lambdas = self._config.rsi.subproblems
             inc_entry: list[int] = [0] * len(lambdas)
             inc_restore: list[str] = ["fresh"] * len(lambdas)
+            inc_wins: list[int] = [0] * len(lambdas)
             try:
                 stored_pool = json.loads(
                     await self._db.get_meta("rsi_moead_incumbents") or "{}",
@@ -291,6 +475,9 @@ class RSIEngine:
                 item = stored_pool.get(str(i))
                 if not isinstance(item, dict):
                     continue
+                stored_wins = item.get("wins")
+                if isinstance(stored_wins, int) and stored_wins > 0:
+                    inc_wins[i] = stored_wins  # 持久累计，跨轮不回退
                 try:
                     spec = GenomeSpec.model_validate_json(
                         item.get("spec_json") or "",
@@ -317,6 +504,49 @@ class RSIEngine:
                 inc_entry[i] = len(entries) - 1
                 inc_restore[i] = "reentered"
 
+            # ---- 2c. 探索注入（U3 多样性坍缩防御）----
+            # 连续同算子部署 ≥K → 注入一个有界随机 retrieval_evolve
+            # 扰动候选：random.Random(dream_seq) 种子可复现，参数在
+            # RetrievalParams 边界内小步抖动，走下方全部校验/回放/
+            # 双门（与任何候选同权竞争，v0 保护不变），origin="explore"。
+            history = await self._db.list_genomes()  # 新版在前
+            consecutive_same_operator = 0  # 头部同算子连跑（探索触发）
+            for g in history:
+                if g.operator != history[0].operator or g.operator == "seed":
+                    break
+                consecutive_same_operator += 1
+            consecutive_deploys = 0  # U4：连续部署（无回滚隔断）轮数
+            for g in history:
+                if g.operator in ("seed", "rollback"):
+                    break
+                consecutive_deploys += 1
+            if (
+                consecutive_same_operator
+                >= self._config.rsi.explore_after_same_operator
+            ):
+                changes = _explore_retrieval_changes(
+                    random.Random(dream_seq), current,
+                )
+                explore_plan = OperatorPlan(
+                    operator="retrieval_evolve",
+                    rationale=(
+                        f"U3 explore: 连续 {consecutive_same_operator} 轮"
+                        f" {history[0].operator} 部署，注入多样性扰动"
+                    ),
+                    retrieval_changes=changes,
+                )
+                explore_outcome = await apply_plan(
+                    current, explore_plan, self._tiers,
+                )
+                if explore_outcome is not None:
+                    e_report = await self._validator.validate(
+                        explore_outcome.genome, current,
+                    )
+                    if e_report.passed:
+                        entries.append(
+                            (explore_outcome.genome, [], "explore"),
+                        )
+
             # ---- 3. 预测（世界模型，E1）+ 回放评分（E2）----
             # U3-3b：排序目标的 quality 分量换混合
             # q′ = (1−pareto_alpha)·quality + pareto_alpha·pareto_auc
@@ -336,7 +566,21 @@ class RSIEngine:
                     + alpha * rep.pareto_auc,
                 )
 
+            def _mix_e2(rep: ReplayReport) -> ObjectiveVector:
+                # U2 双门的 E2 视野：质量分量换 quality_e2（剥 E1
+                # judge_delta），其余维度与 _mix 同式——排序/门用同一
+                # 混合口径，仅质量证据层级不同
+                obj = rep.objective
+                if alpha <= 0.0:
+                    return replace(obj, quality=rep.quality_e2)
+                return replace(
+                    obj,
+                    quality=(1.0 - alpha) * rep.quality_e2
+                    + alpha * rep.pareto_auc,
+                )
+
             ideal = IdealPoint()
+            ideal_e2 = IdealPoint()
             reports: list[ReplayReport] = []
             scored: list[
                 tuple[
@@ -364,6 +608,7 @@ class RSIEngine:
                 replay_report.is_v0 = origin == "v0"  # U3-3b 基准位标注
                 reports.append(replay_report)
                 ideal.update(_mix(replay_report))
+                ideal_e2.update(_mix_e2(replay_report))
                 if origin == "v0":
                     v0_objective = replay_report.objective
                 # —— 预测（仅变异候选）——
@@ -396,8 +641,12 @@ class RSIEngine:
             def _entry_objective(idx: int) -> ObjectiveVector:
                 return _mix(scored[idx][3])
 
+            def _entry_objective_e2(idx: int) -> ObjectiveVector:
+                return _mix_e2(scored[idx][3])
+
             entry_u: list[float] = []
             entry_tprime: list[list[float]] = []
+            entry_tprime_e2: list[list[float]] = []
             for idx, (genome, _, origin) in enumerate(entries):
                 replay_report = scored[idx][3]
                 if origin == "v0":
@@ -413,6 +662,14 @@ class RSIEngine:
                 entry_tprime.append([
                     tprime(
                         _entry_objective(idx), w, ideal, u, lambda_u,
+                    )
+                    for w in lambdas
+                ])
+                # U2 双门：同一 t′ 式、E2 视野（quality_e2）的并行
+                # 度量列——理想点与子问题度量都不含 E1 分量
+                entry_tprime_e2.append([
+                    tprime(
+                        _entry_objective_e2(idx), w, ideal_e2, u, lambda_u,
                     )
                     for w in lambdas
                 ])
@@ -432,22 +689,28 @@ class RSIEngine:
                 err = self.predictor.update(
                     features, replay_report.objective, v0_objective,
                 )
+                # U3 source 分类学：同轮回放回填标 "replay"（E2 自产
+                # 证据），与 E3 生产回填（"production"）区分
+                replay_realized = {
+                    **realized_dict(
+                        replay_report.objective, v0_objective,
+                    ),
+                    "source": "replay",
+                }
                 await backfill_realized(
                     self._db,
                     prediction_id=pid,
-                    realized=realized_dict(
-                        replay_report.objective, v0_objective,
-                    ),
+                    realized=replay_realized,
                 )
                 if id(genome) in candidate_predictions:
                     candidate_predictions[id(genome)]["realized"] = (
-                        realized_dict(replay_report.objective, v0_objective)
+                        replay_realized
                     )
                     candidate_predictions[id(genome)]["abs_err"] = round(
                         err, 4,
                     )
                 # U4：uncertainty（E1）与 penalized（惩罚后的 λ₀ t′，
-                # E2 口径）入事件载荷
+                # E2 口径）入事件载荷；U3 增 realized_source
                 u_pred = float(
                     (candidate_predictions.get(id(genome)) or {})
                     .get("predicted", {})
@@ -463,6 +726,7 @@ class RSIEngine:
                         "penalized": round(t0_penalized, 6),
                         "mae": self.predictor.mae(),
                         "samples": self.predictor.sample_count(),
+                        "realized_source": "replay",
                     },
                 )
 
@@ -470,6 +734,9 @@ class RSIEngine:
             # λ_i 的比较基准 = 恢复后的 incumbent 在**本轮重评**的 t′
             # （当前 ideal 下重算，非存值）；N=2 时邻域退化为全体 λ。
             # 按改进幅度降序贪心应用，单候选至多替换 replace_cap 个。
+            # wins[li] 在每次替换成功时 +1（持久累计，恢复自旧池）——
+            # 替换活性证据，供 doctor 证据制哨兵区分「合法收敛」与
+            # 「休眠」，不再拿「候选从未胜过 v0」当故障。
             inc_holder: list[int] = list(inc_entry)
             improvements: list[tuple[float, int, int]] = []  # (imp, λ, c)
             for ci in range(len(entries)):
@@ -486,7 +753,7 @@ class RSIEngine:
             for imp, li, ci in improvements:
                 if replace_count[ci] >= self._config.rsi.replace_cap:
                     continue  # nr 封顶
-                # 惰性重验：槽位可能已被更大改进换人
+                # 惰性重验：槽位可能已经被更大改进换人
                 imp_now = (
                     entry_tprime[inc_holder[li]][li]
                     - entry_tprime[ci][li]
@@ -494,6 +761,7 @@ class RSIEngine:
                 if imp_now <= 1e-12:
                     continue
                 inc_holder[li] = ci
+                inc_wins[li] += 1
                 replace_count[ci] += 1
                 replacements.append({
                     "lambda": li,
@@ -504,6 +772,11 @@ class RSIEngine:
             # ---- 4c. 部署：质量门内最平衡（U2）----
             # 门 G = {c : t′(c,λ₀) ≤ t′(v0,λ₀)}（v0 恒在 ⇒ 非退化；
             # 门内全部是本轮回放数字，无跨轮口径错配）；
+            # U2 双门 G′ = G ∩ {c : t′_e2(c,λ₀) ≤ t′_e2(v0,λ₀)+ε}——
+            # E2 视野（剥 E1 judge_delta 的 quality_e2）下也不劣于 v0
+            # 才准部署，仅 E1 证据支持的质量优势不得越过 E2/E0 门。
+            # v0 在两门恒属（≤ 自身）⇒ 非退化不变；judge 缺席时
+            # judge_delta≡0 ⇒ t′_e2 ≡ t′，双门退化单门（行为不变）。
             # H† = argmax_G min(quality, cost_eff, safety)；
             # tie-break 链：min(f̂) 平 → λ₀-t′ 小者 → entries 序靠前者
             # （v0 恒为首位 ⇒ 末级平手天然偏 v0；version 不参与——
@@ -514,6 +787,12 @@ class RSIEngine:
                 idx for idx in range(len(entries))
                 if entry_tprime[idx][0] <= v0_score + 1e-12
             ]
+            v0_score_e2 = entry_tprime_e2[v0_idx][0]
+            gate_e2 = {
+                idx for idx in range(len(entries))
+                if entry_tprime_e2[idx][0] <= v0_score_e2 + 1e-12
+            }
+            gate = [idx for idx in gate if idx in gate_e2]
 
             def _balance_key(idx: int) -> tuple[float, float, int]:
                 # U3-3b：平衡键同样用 q′ 混合目标（与 t′ 同一视野）
@@ -531,6 +810,10 @@ class RSIEngine:
 
             report: dict[str, Any]
             deployed = False
+            # U2 incumbent 驱逐标记：部署后置拒绝（pair gate/执行门/
+            # governor 任一拒绝且 winner 非 current）时置为被拒 winner，
+            # 池写回前把持有它的 λ 槽位重置回 v0
+            rejected_winner: GenomeSpec | None = None
             if winner is current:
                 # v0 在门内最平衡 → 保持现状，落败候选 SOP 归档
                 # （incumbent 重评条目无 sop_candidates，循环对其无操作）
@@ -558,6 +841,7 @@ class RSIEngine:
                     for outcome in winner_outcomes:
                         for sop in outcome.sop_candidates:
                             await self._tiers.muscle.archive(sop.id)
+                    rejected_winner = winner
                     report = {
                         "trigger": trigger,
                         "deployed": False,
@@ -569,53 +853,159 @@ class RSIEngine:
                         "v0_score": round(v0_score, 4),
                     }
                 else:
-                    winner.scores = {
-                        # 键名兼容：primary_tchebycheff 由 rsi_history
-                        # 工具消费；值 = t′(λ₀)（λu=0 时与旧口径相同）
-                        "primary_tchebycheff": round(best_score, 4),
-                        "v0_tchebycheff": round(v0_score, 4),
-                        "objectives": best_report.objective.as_tuple(),
-                        "per_lambda_tchebycheff": [
-                            round(t, 4) for t in entry_tprime[winner_idx]
-                        ],
-                        "balanced_min": round(
-                            min(best_report.objective.as_tuple()), 4,
-                        ),
-                        "selector": "balanced",
-                    }
-                    await self._db.save_genome(winner)
-                    # 获胜候选 SOP → active；其余候选 SOP → 归档
-                    winning_ids = {
-                        o.id
-                        for o in _flat_sops(winner_outcomes)
-                    }
-                    for _, genome, outcomes, _ in scored:
-                        for outcome in outcomes:
+                    # ---- 执行门（U2）：隔离栈真实注入/检索/预算硬断言，
+                    #      失败走 pair-gate 拒绝同款路径 ----
+                    exec_result = await run_execution_gate(
+                        winner, current, self._config,
+                        max_inject_chars=self._max_inject_chars,
+                    )
+                    if not exec_result.passed:
+                        for outcome in winner_outcomes:
                             for sop in outcome.sop_candidates:
-                                if sop.id in winning_ids:
-                                    sop.status = "active"
-                                    await self._db.update_memory(sop)
-                                    self._tiers.muscle._mirror.write_muscle(
-                                        sop,
-                                    )
-                                else:
+                                await self._tiers.muscle.archive(sop.id)
+                        rejected_winner = winner
+                        report = {
+                            "trigger": trigger,
+                            "deployed": False,
+                            "reason": (
+                                "执行门拒绝（执行级验证失败）: "
+                                + "; ".join(exec_result.failed_checks)
+                            ),
+                            "candidates": len(scored),
+                            "v0_score": round(v0_score, 4),
+                            "execution_gate": {
+                                "passed": False,
+                                "failed_checks": list(
+                                    exec_result.failed_checks,
+                                ),
+                            },
+                        }
+                    else:
+                        # ---- 治理断路器（U4）：执行门通过后、落库前 ----
+                        gov = self._governor.check_deploy(
+                            time.time(), trigger, consecutive_deploys,
+                        )
+                        if not gov.allowed:
+                            # 拒绝走 pair-gate 同款路径（SOP 归档/
+                            # incumbent 驱逐/v0 保持）
+                            for outcome in winner_outcomes:
+                                for sop in outcome.sop_candidates:
                                     await self._tiers.muscle.archive(
                                         sop.id,
                                     )
-                    deployed = True
-                    report = {
-                        "trigger": trigger,
-                        "deployed": True,
-                        "version": version,
-                        "operator": winner.operator,
-                        "notes": winner.notes,
-                        "candidates": len(scored),
-                        "v0_score": round(v0_score, 4),
-                        "winner_score": round(best_score, 4),
-                    }
+                            rejected_winner = winner
+                            report = {
+                                "trigger": trigger,
+                                "deployed": False,
+                                "reason": f"governor: {gov.reason}",
+                                "candidates": len(scored),
+                                "v0_score": round(v0_score, 4),
+                                "execution_gate": {
+                                    "passed": True,
+                                    "failed_checks": [],
+                                },
+                                "governor_decision": {
+                                    "allowed": False,
+                                    "reason": gov.reason,
+                                },
+                            }
+                        else:
+                            winner.scores = {
+                                # 键名兼容：primary_tchebycheff 由
+                                # rsi_history 工具消费；值 = t′(λ₀）
+                                # （λu=0 时与旧口径相同）
+                                "primary_tchebycheff": round(best_score, 4),
+                                "v0_tchebycheff": round(v0_score, 4),
+                                "objectives": (
+                                    best_report.objective.as_tuple()
+                                ),
+                                "per_lambda_tchebycheff": [
+                                    round(t, 4)
+                                    for t in entry_tprime[winner_idx]
+                                ],
+                                "balanced_min": round(
+                                    min(
+                                        best_report.objective.as_tuple(),
+                                    ), 4,
+                                ),
+                                "selector": "balanced",
+                                # U2：执行门通过打标（供 U4
+                                # verify_executed 探针扫基因组历史）
+                                "execution_gate": True,
+                                # U3 帧锁定审计锚：渲染面指纹
+                                "render_hash": _render_hash(winner),
+                            }
+                            await self._db.save_genome(winner)
+                            # U4：部署记账（速率/冷却窗口）
+                            self._governor.record_deploy(
+                                time.time(), version,
+                            )
+                            # U3 E3 回填链：部署即记 pending 预测
+                            # （genome_version 锚定），下轮 dream 用部署后
+                            # 真实轨迹回填 realized.source="production"
+                            e3_features = CandidateFeatures.extract(
+                                winner, current,
+                            )
+                            await record_prediction(
+                                self._db,
+                                genome_version=version,
+                                operator=winner.operator,
+                                features=e3_features,
+                                prediction=self.predictor.predict(
+                                    e3_features,
+                                ),
+                            )
+                            # 获胜候选 SOP → active；其余候选 SOP → 归档
+                            winning_ids = {
+                                o.id
+                                for o in _flat_sops(winner_outcomes)
+                            }
+                            for _, genome, outcomes, _ in scored:
+                                for outcome in outcomes:
+                                    for sop in outcome.sop_candidates:
+                                        if sop.id in winning_ids:
+                                            sop.status = "active"
+                                            await self._db.update_memory(sop)
+                                            self._tiers.muscle._mirror.write_muscle(
+                                                sop,
+                                            )
+                                        else:
+                                            await self._tiers.muscle.archive(
+                                                sop.id,
+                                            )
+                            deployed = True
+                            report = {
+                                "trigger": trigger,
+                                "deployed": True,
+                                "version": version,
+                                "operator": winner.operator,
+                                "notes": winner.notes,
+                                "candidates": len(scored),
+                                "v0_score": round(v0_score, 4),
+                                "winner_score": round(best_score, 4),
+                                "execution_gate": {
+                                    "passed": True,
+                                    "failed_checks": [],
+                                },
+                                "governor_decision": {
+                                    "allowed": True,
+                                    "reason": gov.reason,
+                                },
+                            }
+
+            # ---- U2 incumbent 驱逐：部署后置拒绝的 winner 不得经池重入
+            #      （否则下轮恢复→重评重赢→再拒，死循环）；被逐槽位
+            #      重置 v0——v0 恒为槽位底线，非退化不受影响 ----
+            evicted: list[int] = []
+            if rejected_winner is not None:
+                for i in range(len(lambdas)):
+                    if entries[inc_holder[i]][0] is rejected_winner:
+                        inc_holder[i] = 0
+                        evicted.append(i)
 
             # ---- incumbent 池写回（U2）：被替换者换人、幸存者刷新
-            #      objectives 为本轮值（【P1】下轮恢复即新鲜）----
+            #      objectives 为本轮值（【P1】下轮恢复即新鲜）；
+            #      wins/last_restore 随池持久化（doctor 证据制哨兵源）----
             pool_out: dict[str, dict[str, Any]] = {}
             for i in range(len(lambdas)):
                 holder = inc_holder[i]
@@ -626,6 +1016,8 @@ class RSIEngine:
                         for x in scored[holder][3].objective.as_tuple()
                     ],
                     "dream_seq": dream_seq,
+                    "wins": inc_wins[i],
+                    "last_restore": inc_restore[i],
                 }
             await self._db.set_meta(
                 "rsi_moead_incumbents",
@@ -639,6 +1031,23 @@ class RSIEngine:
                     "dropped_by_gate": dropped_by_gate,
                     "predictor": self.predictor.stats_summary(),
                     "plugins": self.registry.names(),
+                    # U3 多样性观测面：候选 origin 分布 + 连续同算子部署数
+                    "diversity": {
+                        "origins": dict(Counter(
+                            origin for _, _, origin in entries
+                        )),
+                        "consecutive_same_operator": (
+                            consecutive_same_operator
+                        ),
+                    },
+                    # U3 分布监测透传（诊断侧计算，报告侧不重复实现）
+                    "distribution": (
+                        (diagnosis or {}).get("distribution")
+                    ),
+                    # U4：L1-L5 分级自评（诚实快照，E0）
+                    "level_assessment": assess(await collect(
+                        self._db, self._events, self._config,
+                    )),
                     "evidence": {
                         "signals": _REPORT_EVIDENCE,
                         "legend": evidence_legend(),
@@ -660,10 +1069,12 @@ class RSIEngine:
                         "replace_cap": self._config.rsi.replace_cap,
                         "gate_size": len(gate),
                         "replacements": replacements,
+                        "evicted": evicted,
                         "incumbents": [
                             {
                                 "lambda": i,
                                 "restore": inc_restore[i],
+                                "wins": inc_wins[i],
                                 "holder": entries[inc_holder[i]][2],
                                 "objectives": pool_out[str(i)]["objectives"],
                             }
@@ -689,6 +1100,15 @@ class RSIEngine:
                 }
                 for i in range(len(lambdas))
             ]
+            # U3：本轮回放 judge_delta 非空样本均值（无 judge 模型时
+            # 0.0）——「评审未激活」哨兵的数据源
+            jd_samples = [
+                r.judge_delta for r in reports if r.judge_delta != 0.0
+            ]
+            judge_delta_mean = (
+                round(sum(jd_samples) / len(jd_samples), 4)
+                if jd_samples else 0.0
+            )
             await self._emit(
                 CAT_DREAM,
                 {
@@ -703,6 +1123,17 @@ class RSIEngine:
                     "pareto_auc_winner": report["pareto_auc_winner"],
                     "pareto_auc_v0": report["pareto_auc_v0"],
                     "selector": "balanced",
+                    # U2：执行门结论入观测面（v0 获胜未跑门 → None）
+                    "execution_gate": report.get("execution_gate"),
+                    # U3：judge 信号入观测面（自证回路的评审侧证据）
+                    "judge_delta_mean": judge_delta_mean,
+                    # U4：治理判决与自评等级（未尝试部署 → None）
+                    "governor_decision": report.get("governor_decision"),
+                    "level": report["level_assessment"]["level"],
+                    "candidates": report.get("candidates"),
+                    "traces_evaluated": len(traces),
+                    # 审计聚合用：未部署轮的拒因（部署轮为 None）
+                    "reason": report.get("reason"),
                     "per_lambda_incumbents": per_lambda_incumbents,
                 },
             )
@@ -722,9 +1153,10 @@ class RSIEngine:
 
     async def _emit(
         self, category: str, payload: dict[str, Any],
+        *, level: str = "info",
     ) -> None:
         if self._events is not None:
-            await self._events.emit(category, payload)
+            await self._events.emit(category, payload, level=level)
 
     @staticmethod
     def _brief(r: ReplayReport) -> dict[str, Any]:
@@ -743,12 +1175,49 @@ class RSIEngine:
     # 回滚
     # ------------------------------------------------------------------
     async def rollback(self) -> GenomeSpec | None:
-        """回滚到上一版本（追加式版本历史：复制上一版为新版本）。"""
+        """回滚到上一版本（追加式版本历史：复制上一版为新版本）。
+
+        U4 内检（任何调用方同一防线——rsi_evolve 工具对插件可达、
+        governor 自动回滚、测试直调）：
+
+        - ``pinned_version`` 非空 → 拒（None + CAT_ERROR 事件）；
+        - ``validate(prev, current)`` 复验失败（如 incumbent 污染的
+          dangling SOP）→ 拒 + CAT_ERROR，不落库；
+        - deployment_pause / governor degraded 不拦（回滚是恢复动作）。
+        """
+        pin = self._governor.pinned_version
+        if pin is not None:
+            await self._emit(
+                CAT_ERROR,
+                {
+                    "scope": "governor",
+                    "kind": "pin",
+                    "action": "rollback_denied",
+                    "pinned_version": pin,
+                },
+                level="warn",
+            )
+            return None
         versions = [g.version for g in await self._db.list_genomes()]
         if len(versions) < 2:
             return None
         prev = await self._db.load_genome(versions[1])
         if prev is None:
+            return None
+        current = await self._db.load_genome(versions[0])
+        v_report = await self._validator.validate(prev, current)
+        if not v_report.passed:
+            await self._emit(
+                CAT_ERROR,
+                {
+                    "scope": "governor",
+                    "kind": "revalidation",
+                    "action": "rollback_denied",
+                    "stage": v_report.stage,
+                    "reason": "; ".join(v_report.problems)[:200],
+                },
+                level="warn",
+            )
             return None
         prev.version = versions[0] + 1
         prev.parent_version = versions[0]
@@ -764,3 +1233,54 @@ class RSIEngine:
 def _flat_sops(outcomes: list[MutationOutcome]):
     """获胜 outcomes 里的全部候选 SOP 记录。"""
     return [s for o in outcomes for s in o.sop_candidates]
+
+
+# ----------------------------------------------------------------------
+# U3 失败模式防御：探索扰动 / render_hash / E3 回填常量
+# ----------------------------------------------------------------------
+_E3_MIN_POST_SAMPLES = 5
+"""E3 回填所需的最少部署后带结局轨迹数（不足则保持 pending）。"""
+
+
+def _explore_retrieval_changes(
+    rng: random.Random, current: GenomeSpec,
+) -> dict[str, Any]:
+    """有界随机 retrieval 扰动（纯函数，种子可复现）。
+
+    参数在 ``RetrievalParams`` 边界内围绕当前值小步抖动（top_k ±2 /
+    char_budget ±400 / threshold ±0.05），至少改 top_k 一项，保证候选
+    与父代结构可区分（过「空演化」校验）。
+    """
+    cur = current.retrieval
+    k_choices = [
+        k for k in (
+            cur.top_k - 2, cur.top_k - 1, cur.top_k + 1, cur.top_k + 2,
+        ) if 1 <= k <= 20 and k != cur.top_k
+    ]
+    changes: dict[str, Any] = {"top_k": rng.choice(k_choices)}
+    if rng.random() < 0.7:
+        b_choices = [
+            b for b in (
+                cur.char_budget - 400, cur.char_budget - 200,
+                cur.char_budget + 200, cur.char_budget + 400,
+            ) if 200 <= b <= 8000 and b != cur.char_budget
+        ]
+        if b_choices:
+            changes["char_budget"] = rng.choice(b_choices)
+    if rng.random() < 0.3:
+        t_choices = [
+            t for t in (
+                round(cur.score_threshold - 0.05, 4),
+                round(cur.score_threshold + 0.05, 4),
+            ) if 0.0 <= t <= 1.0 and t != cur.score_threshold
+        ]
+        if t_choices:
+            changes["score_threshold"] = rng.choice(t_choices)
+    return changes
+
+
+def _render_hash(genome: GenomeSpec) -> str:
+    """渲染面指纹：sha256(fragment_text()) 前 16 hex（帧锁定审计锚）。"""
+    return hashlib.sha256(
+        genome.fragment_text().encode("utf-8"),
+    ).hexdigest()[:16]

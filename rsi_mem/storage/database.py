@@ -883,7 +883,8 @@ class RSIMemDatabase:
         await self._run(_set)
 
     def _bump_meta(self, key: str) -> int:
-        """SELECT + UPSERT 自增，整个函数在调用方的单个 locked 段内执行。"""
+        """SELECT + UPSERT 自增，整个函数在 ``_run`` 的
+        ``threading.Lock`` 临界区内执行（原子范围仅限单进程）。"""
         row = self._conn.execute(
             "SELECT value FROM meta WHERE key=?", (key,),
         ).fetchone()
@@ -896,11 +897,14 @@ class RSIMemDatabase:
         return value
 
     async def bump_meta(self, key: str) -> int:
-        """原子自增 meta 计数并返回自增后的值（U1 债务④）。
+        """自增 meta 计数并返回自增后的值（U1 债务④）。
 
-        单次 ``_run`` 内单个 locked 段完成读-改-写，替代调用方
-        ``get_meta`` + ``set_meta`` 两次独立 await 的丢更新窗口
-        （并发计数不再互相覆盖）；多 worker 经 WAL 单连接天然合并。
+        **原子性范围（声明修正）**：单进程内，读-改-写在单次 ``_run``
+        的 ``threading.Lock`` 临界区中原子完成——同进程并发协程/线程
+        不会丢更新（替代调用方 ``get_meta`` + ``set_meta`` 两次独立
+        await 的窗口）。**跨进程/跨连接不保证原子**：两个进程各持连接
+        与各持锁，读-改-写交错可能丢更新；多进程部署须遵守单写者约定
+        （仅一个进程执行 dream/固化等 meta 写路径）。
         """
         return await self._run(self._bump_meta, key)
 

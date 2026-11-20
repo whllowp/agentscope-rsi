@@ -263,8 +263,18 @@ async def test_diagnosis_annotated_with_evidence(ctx):
 
 async def test_bench_ten_rounds_non_degrading(tmp_path):
     from rsi_mem.bench.rounds import run_bench
+    from rsi_mem.config import GovernanceConfig
 
-    cfg = RSIMemConfig(data_dir=str(tmp_path / "bench"))
+    # U4 治理契约：bench 需要宽松治理，且必须在**构造期**传入
+    # （构造后覆盖只能走整字段重赋值旁路，不支持）
+    cfg = RSIMemConfig(
+        data_dir=str(tmp_path / "bench"),
+        governance=GovernanceConfig(
+            max_deploys_per_hour=10 ** 6,
+            min_deploy_interval_s=0.0,
+            consecutive_deploy_limit=10 ** 6,
+        ),
+    )
     context = RSIMemContext(cfg)
     try:
         report = await run_bench(
@@ -380,39 +390,93 @@ def _u4_plugins():
     ]
 
 
-async def test_doctor_subproblem_coverage_sentinel(tmp_path):
-    """②子问题覆盖：meta 全同 version → warn；正常 3 轮 dream 后
-    （λ₁ 有独立 incumbent）不告警。"""
+async def test_subproblem_sentinel_evidence_based(tmp_path):
+    """②子问题哨兵（U1 证据制修订）：restore 失败才 warn；全同
+    version 按 wins 分级 info（合法收敛 / 休眠）——「候选从未胜过
+    v0」不再误报；旧格式池降级 info；版本分化不报。"""
     from rsi_mem.cli import doctor
 
-    # —— a) 全同 version → 告警 ——
-    ctx = RSIMemContext(RSIMemConfig(data_dir=str(tmp_path / "u4_same")))
-    try:
-        current = await ctx.db.active_genome()
-        spec_json = current.model_dump_json()
-        pool = {
+    def _pool(spec_json, *, wins=None, last_restores=None, new_keys=True):
+        return {
             str(i): {
                 "spec_json": spec_json,
                 "objectives": [0.5, 0.5, 1.0],
                 "dream_seq": 1,
+                **(
+                    {} if not new_keys else {
+                        "wins": (wins or [0, 0])[i],
+                        "last_restore": (
+                            last_restores or ["fresh", "fresh"]
+                        )[i],
+                    }
+                ),
             }
-            for i in range(len(ctx.config.rsi.subproblems))
+            for i in range(2)
         }
-        await ctx.db.set_meta(
-            "rsi_moead_incumbents", json.dumps(pool, ensure_ascii=False),
-        )
-        result = await doctor(ctx)
-        assert any(
-            "第二子问题从未激活" in f["message"]
-            for f in result["findings"]
-        ), "全同 version incumbents 应触发 U2 回归哨兵"
-        assert not any(
-            "Pareto" in f["message"] for f in result["findings"]
-        ), "无事件日志（无该字段）时 Pareto 检查静默降级，不误报"
-    finally:
-        await ctx.close()
 
-    # —— b) 正常 3 轮 dream：λ₁ 持续 held by 独立 incumbent → 不告警 ——
+    async def _doctor_for(name, pool):
+        ctx = RSIMemContext(RSIMemConfig(data_dir=str(tmp_path / name)))
+        try:
+            current = await ctx.db.active_genome()
+            pool = pool(current.model_dump_json())
+            await ctx.db.set_meta(
+                "rsi_moead_incumbents",
+                json.dumps(pool, ensure_ascii=False),
+            )
+            return await doctor(ctx)
+        finally:
+            await ctx.close()
+
+    # —— A) 任一 λ last_restore=dropped:* → warn（真实机制失效证据）——
+    result_a = await _doctor_for(
+        "u1_sent_a",
+        lambda s: _pool(
+            s, wins=[3, 2],
+            last_restores=["is_current", "dropped:integrity"],
+        ),
+    )
+    warn_a = [
+        f for f in result_a["findings"] if f["severity"] == "warn"
+    ]
+    assert any(
+        "恢复失败" in f["message"] and "机制失效" in f["message"]
+        for f in warn_a
+    ), "restore 失败（校验拒绝/存储损坏）应 warn"
+    assert not any(
+        "Pareto" in f["message"] for f in result_a["findings"]
+    ), "无事件日志（无该字段）时 Pareto 检查静默降级，不误报"
+
+    # —— B) 全同 version + wins=[3,2] → info「合法收敛」（非故障）——
+    result_b = await _doctor_for(
+        "u1_sent_b",
+        lambda s: _pool(
+            s, wins=[3, 2],
+            last_restores=["is_current", "reentered"],
+        ),
+    )
+    assert [f["severity"] for f in result_b["findings"]] == ["info"]
+    assert "合法收敛" in result_b["findings"][0]["message"], \
+        "全 λ 有替换胜出记录的全同 version 是支配解合法收敛，非故障"
+
+    # —— C) 全同 version + wins=[0,0] → info「休眠」（残余误报消除）——
+    result_c = await _doctor_for(
+        "u1_sent_c",
+        lambda s: _pool(s, wins=[0, 0]),
+    )
+    assert [f["severity"] for f in result_c["findings"]] == ["info"]
+    assert "休眠" in result_c["findings"][0]["message"], \
+        "候选从未胜过 v0 是休眠（info），不得再报 warn"
+
+    # —— D) 旧格式池（无 wins/last_restore 键）→ 降级 info 不 warn ——
+    result_d = await _doctor_for(
+        "u1_sent_d",
+        lambda s: _pool(s, new_keys=False),
+    )
+    assert [f["severity"] for f in result_d["findings"]] == ["info"]
+    assert "旧格式" in result_d["findings"][0]["message"], \
+        "旧池无证据键 → 向后兼容降级 info"
+
+    # —— E) 版本分化（真实 3 轮 dream，λ₁ 独立 incumbent）→ 不报 ——
     ctx2 = RSIMemContext(RSIMemConfig(data_dir=str(tmp_path / "u4_ok")))
     try:
         await _u4_quality_binding_stage(ctx2)
@@ -432,13 +496,106 @@ async def test_doctor_subproblem_coverage_sentinel(tmp_path):
         }
         assert len(versions) > 1, \
             f"前置：per-λ incumbent 版本应分化（实际 {versions}）"
+        # 前置：真实 dream 后池带新键，且 λ₁ 有替换胜出证据
+        assert pool["1"]["wins"] >= 1, "λ₁ 替换胜出被持久累计"
+        assert not str(pool["1"]["last_restore"]).startswith("dropped:")
         result2 = await doctor(ctx2)
         assert not any(
-            "第二子问题从未激活" in f["message"]
+            any(k in f["message"] for k in (
+                "恢复失败", "合法收敛", "休眠", "旧格式",
+            ))
             for f in result2["findings"]
-        )
+        ), "版本分化（per-λ 正常分化）→ 哨兵不报"
     finally:
         await ctx2.close()
+
+
+async def test_bump_meta_single_process_serialized(ctx):
+    """③bump_meta 单进程串行化（U1 声明修正的既定保证范围）：
+    asyncio.gather 并发 100 次自增，终值恰 +100——读-改-写在
+    ``threading.Lock`` 临界区内不丢更新（跨进程不在此范围）。"""
+    before = await ctx.db.get_meta("dream_seq")
+    start = int(before) if before is not None else 0
+    values = await asyncio.gather(*[
+        ctx.db.bump_meta("dream_seq") for _ in range(100)
+    ])
+    # 返回值本身无重复：每次自增拿到互不相同的序号
+    assert len(set(values)) == 100, "并发自增的返回值不得重复"
+    after = int(await ctx.db.get_meta("dream_seq"))
+    assert after == start + 100, f"终值恰 +100（实际 {start} → {after}）"
+
+
+async def test_l3_budget_lower_bound(tmp_path):
+    """④L3 预算下限对齐：599 → 构造时显式 ValidationError（优于负
+    预算静默退化成恒留 1 条）；600 通过；effective_l3_budget 统一
+    tiers 注入截断与 consolidate 瘦身两处口径。"""
+    from pydantic import ValidationError
+
+    from rsi_mem.config import ReviewConfig
+    from rsi_mem.memory.guards import l3_eligible, set_verification
+    from rsi_mem.memory.tiers import effective_l3_budget
+
+    with pytest.raises(ValidationError):
+        ReviewConfig(l3_char_budget=599)
+    assert ReviewConfig(l3_char_budget=600).l3_char_budget == 600
+    assert effective_l3_budget(ReviewConfig(l3_char_budget=600)) == 200
+    assert effective_l3_budget(ReviewConfig()) == 800  # 默认 1200−400
+
+    ctx = RSIMemContext(RSIMemConfig(data_dir=str(tmp_path / "u1_l3")))
+    try:
+        effective = effective_l3_budget(ctx.config.review)
+        assert effective == 800
+        # 6 条 trace_verified L3_core：display 合计 ~1300 > 800
+        for i in range(6):
+            rec = await ctx.tiers.longterm.add(
+                title=f"L3 档案{i}", layer="L3_core",
+                content=f"档案{i}要点：" + "细节" * 150,
+            )
+            loaded = await ctx.db.get_memory(rec.id)
+            set_verification(loaded, "trace_verified", ["trace:seed"])
+            await ctx.db.update_memory(loaded)
+        eligible = [
+            c for c in await ctx.db.list_memories(
+                tier="long", layer="L3_core",
+                status="active,promoted", limit=30,
+            ) if l3_eligible(c)
+        ]
+        total = sum(len(c.display(200)) for c in eligible)
+        assert len(eligible) == 6 and total > effective, \
+            f"前置：L3 段合计超预算（{total} > {effective}）"
+
+        # a) tiers 注入路径：L3 段字符被截到 effective 预算内
+        genome = await ctx.db.active_genome()
+        block, _ = await ctx.tiers.system_prompt_block_with_ids(
+            query="细节", genome=genome,
+        )
+        parts = block.split("\n\n")
+        start = next(
+            i for i, p in enumerate(parts)
+            if p.startswith("## 核心档案")
+        )
+        l3_lines = []
+        for p in parts[start + 1:]:
+            if p.startswith("## "):
+                break
+            l3_lines.append(p)
+        assert 0 < len(l3_lines) < 6, "运行时截断应丢掉超预算尾部"
+        assert sum(len(x) for x in l3_lines) <= effective, \
+            "注入面 L3 段字符合计 ≤ effective_l3_budget"
+
+        # b) consolidate 瘦身插槽：同一 effective 预算触发 demote，
+        #    降级后 L3 注入面合计也回到该预算内
+        proposals = await ctx.consolidator.review_session(None, [])
+        demos = [
+            p for p in proposals if p.action == "demote_l3"
+        ]
+        assert demos, "合计超预算应触发瘦身降级提议"
+        cores_after = await ctx.tiers.retriever.core_profile()
+        total_after = sum(len(c.display(200)) for c in cores_after)
+        assert 0 < total_after <= effective, \
+            f"瘦身口径与注入口径一致（{total_after} ≤ {effective}）"
+    finally:
+        await ctx.close()
 
 
 async def test_doctor_pareto_degradation_from_events(tmp_path):

@@ -21,6 +21,7 @@ from agentscope.model import ChatModelBase
 
 from ..config import RSIMemConfig
 from ..storage import MemoryRecord, PendingReview, TraceRecord
+from ..telemetry import CAT_REVIEW, LocalEventLog
 from .guards import (
     broken_link_reason,
     find_contradictions,
@@ -31,7 +32,7 @@ from .guards import (
     verification_of,
 )
 from .salience import dream_priority, tag_of
-from .tiers import L3_INDEX_MARGIN, TierManager
+from .tiers import TierManager, effective_l3_budget
 
 _SOP_MIN_REPEAT = 2
 
@@ -42,9 +43,16 @@ _DEDUP_SCAN_LIMIT = 300
 class Consolidator:
     """周期固化审查。"""
 
-    def __init__(self, config: RSIMemConfig, tiers: TierManager) -> None:
+    def __init__(
+        self,
+        config: RSIMemConfig,
+        tiers: TierManager,
+        *,
+        events: LocalEventLog | None = None,
+    ) -> None:
         self._config = config
         self._tiers = tiers
+        self._events = events
 
     async def review_session(
         self,
@@ -101,8 +109,20 @@ class Consolidator:
                 if state == "auto_applied":
                     p.resolved_by = "auto"
                 out.append(p)
+                # U3：确认执行落 CAT_REVIEW（此前全库无 emit 点，审查
+                # 决策在 events.jsonl 里不可见）
+                if self._events is not None:
+                    await self._events.emit(
+                        CAT_REVIEW,
+                        {
+                            "action": p.action,
+                            "resolution": state,
+                            "memory_id": p.memory_id,
+                            "confidence": p.confidence,
+                        },
+                    )
             except Exception as e:  # noqa: BLE001
-                logger.warning("propose %s failed: %s", p.action, e)
+                logger.warning("propose %s failed: %s", p.id, e)
         await self._tiers.maintenance()
         return out
 
@@ -538,9 +558,10 @@ class Consolidator:
     async def _propose_injection_slimming(self) -> list[PendingReview]:
         """插槽 (4)：L3 段渲染字符合计超 ``l3_char_budget`` → demote_l3。
 
-        合计口径（写死）：L3 段 + U4 索引段 ≤ ``l3_char_budget``=1200，
-        实现预留 ``L3_INDEX_MARGIN``=400 索引余量（与 U4 注入路径共用
-        同一常量）。超限按
+        合计口径（与 U4 注入路径共用同一函数）：L3 段 + U4 索引段 ≤
+        ``l3_char_budget``，实现预留 ``L3_INDEX_MARGIN``=400 索引余量
+        （``effective_l3_budget`` 统一两处口径，配置层 ge=600 保证
+        预算恒 ≥200）。超限按
         (trace_verified, hit_count, dream_priority) 排序保留头部，其余
         复用 U2 ``demote_l3``（tier/status 不动保证回放兼容；留 related
         链接保持 L3 面可达）。
@@ -553,7 +574,7 @@ class Consolidator:
         eligible = [c for c in cores if l3_eligible(c)]
         if not eligible:
             return []
-        budget = self._config.review.l3_char_budget - L3_INDEX_MARGIN
+        budget = effective_l3_budget(self._config.review)
         total = sum(len(c.display(200)) for c in eligible)
         if total <= budget:
             return []

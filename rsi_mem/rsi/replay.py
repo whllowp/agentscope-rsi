@@ -76,6 +76,12 @@ class ReplayReport:
     """ρ 扫描点集：每轨迹 {trace_id, points: [[n,a]×|ρ|], budget}。"""
     is_v0: bool = False
     """engine 对 v0 条目置 True（U3-3b 起回放报告显式标注基准位）。"""
+    quality_e2: float = 0.5
+    """E2 质量分量（U2 双门）：clamp(base_quality×coverage + 0.1×
+    sop_coverage, 0, 1)——即 quality_floor 剥掉 0.15×judge_delta 项。
+    仅 E1（LLM 评审）证据支持的质量优势不得据此越过 E2/E0 门。
+    judge 缺席时 judge_delta≡0，quality_e2 == quality，双门退化单门
+    （现有测试与 bench 行为不变）。"""
 
 
 def _fragment_chars(genome: GenomeSpec) -> int:
@@ -228,6 +234,7 @@ class ReplayEvaluator:
         points: list[dict[str, Any]] = []
         est_tokens_full: list[float] = []
         aucs: list[float] = []
+        n_effective_traces = 0
         k_over_n: list[float] = []
         # S = 池内最高 outcome.score（a 的归一分母；P10：S≤0 → a≡0）
         max_score = max(
@@ -309,13 +316,21 @@ class ReplayEvaluator:
             # B_i = ρ=1（候选满预算）点的 est tokens
             budget_i = per_rho_n.get(full_rho, 0.0)
             est_tokens_full.append(budget_i)
-            aucs.append(pareto_frontier_auc(per_rho, budget_i))
+            # U3 n_effective：该轨迹 a 有区分度的 ρ 点数（不同 a 值数）。
+            # 全平（n_effective<2）的轨迹前沿面积恒 0——计入均值会把
+            # 信号稀释成恒定低值（实测 5 轮 bench 全轮 AUC=0，严格递减
+            # 哨兵永盲），故 AUC 均值只含有区分度的轨迹
+            n_effective = len({round(a, 6) for _, a in per_rho})
+            if n_effective >= 2:
+                aucs.append(pareto_frontier_auc(per_rho, budget_i))
+                n_effective_traces += 1
             points.append({
                 "trace_id": trace.id[:8],
                 "points": [
                     [round(n, 1), round(a, 4)] for n, a in per_rho
                 ],
                 "budget": round(budget_i, 1),
+                "n_effective": n_effective,
             })
             if trace.tool_calls:
                 k_over_n.append(
@@ -335,6 +350,16 @@ class ReplayEvaluator:
                 base_quality * coverage + quality_floor,
             ),
         )
+        # U2 双门的 E2 质量分量：剥 judge_delta（E1）项，只留确定性
+        # E2/E0 分量（base×coverage + SOP 触发覆盖加成）
+        quality_e2 = max(
+            0.0,
+            min(
+                1.0,
+                base_quality * coverage
+                + _SOP_COVERAGE_BONUS * sop_coverage,
+            ),
+        )
         mean_tokens = (
             sum(est_tokens_full) / len(est_tokens_full)
             if est_tokens_full else 0.0
@@ -345,7 +370,10 @@ class ReplayEvaluator:
         )
         perm_total = sum(len(t.permissions) for t in traces)
 
-        # ---- Pareto 前沿面积（空样本保持默认 1.0，旧测试兼容）----
+        # ---- Pareto 前沿面积（口径）----
+        # 有样本但零区分度（全被 n_effective 过滤）→ 0.0：前沿无从
+        # 谈起且不能伪装成"满分"；空样本（无轨迹）保持默认 1.0
+        # （旧测试口径：无点集无从计算）
         if aucs:
             pareto_auc = max(
                 0.0,
@@ -357,6 +385,8 @@ class ReplayEvaluator:
                     ),
                 ),
             )
+        elif sample:
+            pareto_auc = 0.0
         else:
             pareto_auc = 1.0
 
@@ -385,10 +415,13 @@ class ReplayEvaluator:
             coverage=round(coverage, 4),
             est_tokens_mean=round(mean_tokens, 1),
             judge_delta=round(judge_delta, 4),
+            quality_e2=round(quality_e2, 4),
             judge_reason=judge_reason,
             details={
                 "traces_evaluated": len(sample),
                 "rho_grid": list(rho_grid),
+                # U3：AUC 均值口径里的有效轨迹数（n_effective≥2）
+                "n_effective_traces": n_effective_traces,
             },
             pareto_auc=round(pareto_auc, 4),
             points=points,

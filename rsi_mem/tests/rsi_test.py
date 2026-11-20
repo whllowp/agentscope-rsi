@@ -591,6 +591,107 @@ async def test_moead_incumbents_persist_across_engine_restart(tmp_path):
         await ctx2.close()
 
 
+async def test_wins_end_to_end_real_dream(tmp_path):
+    """U1 wins 端到端（真实 dream）：λ₁ 邻域替换发生 → meta 池 wins≥1
+    且 last_restore 非 dropped；次轮恢复成功后 wins 持久累计不回退
+    （doctor 证据制哨兵的数据源就是这两个键）。"""
+    from .fixtures import FixedPlanPlugin
+
+    class _RetrievalFixedPlan(FixedPlanPlugin):
+        """FixedPlanPlugin 变体：一次性优质 retrieval 变更（λ₁ 舞台）。"""
+
+        name = "fixed-retrieval-plan"
+
+        def __init__(self, plan: OperatorPlan) -> None:
+            super().__init__()
+            self._plan = plan
+            self._fired = False
+
+        async def propose_plans(
+            self, diagnosis, current, traces, *, model=None,
+        ):
+            if diagnosis is None or self._fired:
+                return []
+            self._fired = True
+            return [self._plan]
+
+    ctx = _u2_ctx(tmp_path, "u1_wins")
+    try:
+        await _seed_cost_stage(ctx)
+        ctx.engine.registry.add(_RetrievalFixedPlan(_cost_plan()))
+        r1 = await ctx.engine.dream(trigger="u1-wins1")
+        inc1 = {x["lambda"]: x for x in r1["moead"]["incumbents"]}
+        assert inc1[1]["holder"] == "fixed-retrieval-plan", \
+            "前置：λ₁（成本优先）被 retrieval 候选经邻域替换占据"
+        pool = json.loads(await ctx.db.get_meta("rsi_moead_incumbents"))
+        for i in range(len(ctx.config.rsi.subproblems)):
+            assert {
+                "spec_json", "objectives", "dream_seq",
+                "wins", "last_restore",
+            } <= set(pool[str(i)]), "池 item 五键齐备"
+        assert pool["1"]["wins"] >= 1, "λ₁ 替换胜出至少计入一次"
+        assert not str(pool["1"]["last_restore"]).startswith("dropped:"), \
+            "首轮无恢复，last_restore=fresh"
+        assert pool["1"]["last_restore"] == "fresh"
+        assert inc1[1]["wins"] == pool["1"]["wins"], "报告与池同源一致"
+
+        # 第二轮：无新候选，λ₁ incumbent 恢复成功 → wins 恢复自旧池
+        await ctx.engine.dream(trigger="u1-wins2")
+        pool2 = json.loads(await ctx.db.get_meta("rsi_moead_incumbents"))
+        assert pool2["1"]["wins"] >= pool["1"]["wins"], \
+            "wins 是持久累计（恢复自旧池），跨轮不得回退清零"
+        assert pool2["1"]["last_restore"] in (
+            "reentered", "is_current", "shared",
+        ), f"恢复成功（实际 {pool2['1']['last_restore']}），非 dropped"
+        assert not str(pool2["1"]["last_restore"]).startswith("dropped:")
+    finally:
+        await ctx.close()
+
+
+async def test_e1_only_candidate_blocked_by_e2_gate(tmp_path):
+    """⑥U2 双门：质量优势纯来自 judge_delta（E1）的候选不得部署——
+    E2 视野（剥 E1 分量）下它劣于 v0，被拦出双门；无 judge 时
+    judge_delta≡0、双门退化单门，行为与旧版一致。"""
+    from .fixtures import FixedPlanPlugin
+
+    ctx = _u2_ctx(tmp_path, "u2_e1only")
+    try:
+        await _seed_cost_stage(ctx)
+        ctx.engine.registry.add(FixedPlanPlugin())  # 小片段候选，E2 与 v0 等价
+        judge = DummyChatModel(script=[
+            '{"quality_delta": 1.0, "reason": "仅 E1 证据"}',
+        ] * 3)
+        report = await ctx.engine.dream(trigger="e1-only", judge_model=judge)
+        # 前置：judge +1 确实抬升了候选的 E1 质量分量
+        v0_q = next(
+            r["objectives"][0] for r in report["replays"] if r["is_v0"]
+        )
+        cand_q = max(
+            r["objectives"][0]
+            for r in report["replays"] if not r["is_v0"]
+        )
+        assert cand_q > v0_q, "前置：E1 抬升可见"
+        # 双门：E2 视野下仅 E1 优势的候选出 G′（单门下它会过门部署）
+        assert report["moead"]["gate_size"] == 1
+        assert report["deployed"] is False, "仅 E1 证据的候选不得部署"
+        assert "无候选优于" in report["reason"]
+    finally:
+        await ctx.close()
+
+    # 对照组：无 judge → 双门退化单门，行为不变
+    ctx0 = _u2_ctx(tmp_path, "u2_e1only_ctrl")
+    try:
+        await _seed_cost_stage(ctx0)
+        ctx0.engine.registry.add(FixedPlanPlugin())
+        r0 = await ctx0.engine.dream(trigger="e1-only-ctrl")
+        assert all(r["judge_delta"] == 0.0 for r in r0["replays"])
+        assert r0["moead"]["gate_size"] == 1
+        assert r0["deployed"] is False, "无 judge 时不部署（与旧单门一致）"
+        assert "无候选优于" in r0["reason"]
+    finally:
+        await ctx0.close()
+
+
 async def test_moead_report_keys_and_tool_compat(tmp_path):
     """⑦键名兼容：v0_score/winner_score（λ₀ t′）+ 工具消费
     primary_tchebycheff。"""

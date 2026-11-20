@@ -10,6 +10,7 @@ evidence-integrity gate）。
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from typing import Any
 
@@ -43,6 +44,60 @@ def _first_text(resp: Any) -> str:
         if getattr(block, "type", "") == "text" and block.text:
             return block.text
     return ""
+
+
+_CJK_RE = re.compile(r"[^\u4e00-\u9fff]+")
+_ASCII_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _keyword_buckets(traces: list[TraceRecord]) -> tuple[str, float]:
+    """关键词桶 top 占比：最热桶覆盖的轨迹比例（查询同质化观测）。
+
+    分词口径：CJK 双字 bigram + 长度 ≥2 的 ASCII 词（casefold）。
+    """
+    counts: Counter = Counter()
+    total = 0
+    for t in traces:
+        q = (t.query or "").casefold()
+        toks = {m for m in _ASCII_WORD_RE.findall(q) if len(m) >= 2}
+        cjk = _CJK_RE.sub("", q)
+        toks.update(
+            cjk[i : i + 2] for i in range(len(cjk) - 1)
+        )
+        if toks:
+            total += 1
+            counts.update(toks)
+    if not counts or not total:
+        return "", 0.0
+    top_kw, top_n = counts.most_common(1)[0]
+    return top_kw, round(top_n / total, 4)
+
+
+def _distribution(traces: list[TraceRecord]) -> dict[str, Any]:
+    """U3 分布监测：查询/关键词/来源三类分布（自证回路观测面）。
+
+    source 缺失键按 ``production`` 计（旧轨迹/直写轨迹），另计
+    ``untagged`` 数供人工核查分类完备度。
+    """
+    queries = [t.query or "" for t in traces]
+    unique = len({q for q in queries if q})
+    sources: Counter = Counter()
+    untagged = 0
+    for t in traces:
+        signals = (t.outcome.signals if t.outcome else None) or {}
+        if t.outcome is not None and "source" not in signals:
+            untagged += 1
+        sources[signals.get("source") or "production"] += 1
+    top_kw, top_share = _keyword_buckets(traces)
+    return {
+        "unique_query_ratio": round(unique / max(1, len(traces)), 4),
+        "top_keyword": top_kw,
+        "top_keyword_share": top_share,
+        "source_ratio": {
+            k: round(v / len(traces), 4) for k, v in sources.items()
+        },
+        "untagged": untagged,
+    }
 
 
 class Improver:
@@ -101,6 +156,7 @@ class Improver:
                  "query": t.query[:80]} for t in best
             ],
             "cited_trace_ids": cited_trace_ids,
+            "distribution": _distribution(traces),
         }
 
     # ------------------------------------------------------------------

@@ -10,6 +10,12 @@
 
 任一段失败 → 一次修复机会（丢弃非法片段/SOP 引用后复检），仍失败
 则该候选被淘汰。
+
+**治理不可演化声明（U4）**：本校验器只约束**基因组内容**，不承载
+治理参数——断路器（速率/冷却/质量回滚）在 ``rsi_mem/governor.py``，
+参数经 ``RSIEngine`` 构造期快照自 frozen ``GovernanceConfig``，任何
+基因组/算子/插件路径都写不到它。校验规则本身（含锁定片段全字段
+锁）是代码常量，不在 RSI 可改对象内。
 """
 from __future__ import annotations
 
@@ -88,19 +94,34 @@ class GenomeValidator:
 
         # ---- 3. 完整性段 ----
         problems = []
-        parent_locked = {
-            f.id: f.text
-            for f in parent.prompt_fragments if f.locked
-        }
-        cand_locked = {
-            f.id: f.text
-            for f in candidate.prompt_fragments if f.locked
-        }
-        for fid, text in parent_locked.items():
+        # U2 全字段锁：锁定片段的 (text, enabled, slot, triggers) 四元
+        # 组逐字段比对——旧版只比 text，enabled=False / slot=reflex 可
+        # 让锁定片段静默退出渲染面（fragment_text 只渲染 enabled 且
+        # always）而校验照过，等于旁路删除。四算子不触这些字段，
+        # 合法候选不受影响。
+        _lock_fields = ("text", "enabled", "slot", "triggers")
+
+        def _locked_sig(genome: GenomeSpec) -> dict[str, tuple]:
+            return {
+                f.id: (
+                    f.text, f.enabled, f.slot, tuple(f.triggers),
+                )
+                for f in genome.prompt_fragments if f.locked
+            }
+
+        parent_locked = _locked_sig(parent)
+        cand_locked = _locked_sig(candidate)
+        for fid, p_sig in parent_locked.items():
             if fid not in cand_locked:
                 problems.append(f"锁定片段被删除: {fid}")
-            elif cand_locked[fid] != text:
-                problems.append(f"锁定片段被改写: {fid}")
+                continue
+            c_sig = cand_locked[fid]
+            for name, pv, cv in zip(_lock_fields, p_sig, c_sig):
+                if pv != cv:
+                    problems.append(
+                        f"锁定片段字段 {name} 被篡改"
+                        f"（{pv!r} → {cv!r}）: {fid}",
+                    )
         ids = [f.id for f in candidate.prompt_fragments]
         if len(ids) != len(set(ids)):
             problems.append("片段 id 重复")

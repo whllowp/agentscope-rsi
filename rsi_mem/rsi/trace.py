@@ -137,18 +137,23 @@ class TraceRecorder:
             interrupted=interrupted,
         )
         self.record.digest = digest[:500]
+        signals = {
+            "has_answer": has_answer,
+            "max_iters_exceeded": max_iters_exceeded,
+            "tool_error_ratio": round(error_ratio, 3),
+            "tool_calls": len(calls),
+            "model_calls": len(self.record.model_calls),
+            # (n,k*) 数据（U3-3a）：回放并行度惩罚的数据前置
+            "calls_n": len(calls),
+            "serial_rounds_k": serial_rounds_k(calls),
+        }
+        # U3 source 分类学：真实轨迹（TraceRecorder 主路径）就是外部
+        # 真实信号，缺省置 "production"；合成/导入轨迹（bench 等）显式
+        # 自带自己的 source，不被此处覆盖
+        signals.setdefault("source", "production")
         self.record.outcome = OutcomeRecord(
             score=round(score, 3),
-            signals={
-                "has_answer": has_answer,
-                "max_iters_exceeded": max_iters_exceeded,
-                "tool_error_ratio": round(error_ratio, 3),
-                "tool_calls": len(calls),
-                "model_calls": len(self.record.model_calls),
-                # (n,k*) 数据（U3-3a）：回放并行度惩罚的数据前置
-                "calls_n": len(calls),
-                "serial_rounds_k": serial_rounds_k(calls),
-            },
+            signals=signals,
         )
         await self.upsert()
         if self._events is not None:

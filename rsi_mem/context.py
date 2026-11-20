@@ -47,7 +47,9 @@ class RSIMemContext:
         self.extractor = TurnExtractor(
             self.config, self.tiers, langfuse=self.langfuse,
         )
-        self.consolidator = Consolidator(self.config, self.tiers)
+        self.consolidator = Consolidator(
+            self.config, self.tiers, events=self.events,
+        )
         self.engine = RSIEngine(
             self.config,
             self.db,

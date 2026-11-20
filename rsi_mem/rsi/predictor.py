@@ -139,7 +139,13 @@ class OutcomePredictor:
 
     # ------------------------------------------------------------------
     async def _ensure_loaded(self) -> None:
-        """从 predictions 表恢复按算子统计（幂等）。"""
+        """从 predictions 表恢复按算子统计（幂等）。
+
+        U3 自证回路防御：``realized.source == "production"`` 的行
+        （E3 生产回填）**跳过**——否则部署后真实轨迹的分数会被当成
+        世界模型的自校准样本，形成「自己评价自己」。过滤发生在
+        **加载层**而非运行期内存态，跨重启/跨引擎实例同样成立。
+        """
         if self._loaded:
             return
         try:
@@ -147,6 +153,8 @@ class OutcomePredictor:
         except Exception:  # noqa: BLE001 — 兼容空库
             rows = []
         for row in rows:
+            if (row["realized"] or {}).get("source") == "production":
+                continue
             stats = self._stats.setdefault(
                 row["operator"], OperatorStats(),
             )

@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentscope.embedding import EmbeddingModelBase
 from agentscope.model import ChatModelBase
@@ -65,9 +65,12 @@ class ReviewConfig(BaseModel):
     long_soft_cap: int = Field(default=500, ge=10)
     """长期层软上限（软信号，非写入墙）：超限时去重相似阈值 0.85→0.75
     放宽，且去重/瘦身插槽在维护预算内提到队首（瘦身优先级提升）。"""
-    l3_char_budget: int = Field(default=1200, ge=200)
+    l3_char_budget: int = Field(default=1200, ge=600)
     """L3 注入段合计字符预算（合计口径 = L3 段 + U4 索引段；实现预留
-    ``_L3_INDEX_MARGIN``=400 索引余量）。超限按
+    ``L3_INDEX_MARGIN``=400 索引余量，L3 段实际预算 =
+    ``effective_l3_budget`` = l3_char_budget − 400）。**下限 600** =
+    400 余量 + 200 最小注入：存量 <600 时裸减得负/零预算，截断退化
+    为恒留 1 条——构造时显式 ``ValidationError`` 优于静默退化。超限按
     (trace_verified, hit_count, dream_priority) 排序保留头部，其余
     ``demote_l3``。"""
 
@@ -123,6 +126,44 @@ class RSIConfig(BaseModel):
     parallel_lambda: float = Field(default=0.0, ge=0.0)
     """并行度惩罚系数（U3-3b）：V = mean(AUC) − λ·mean(k*/n)。默认 0
     ——现网轨迹串行、k*/n 区分度弱，接口就位不硬凑。"""
+    explore_after_same_operator: int = Field(default=3, ge=1)
+    """连续同算子部署达到 N 轮 → 注入一个有界随机 retrieval_evolve
+    扰动候选（origin="explore"，random.Random(dream_seq) 可复现），
+    走全部校验/回放/双门——多样性坍缩防御，v0 保护不变。"""
+    external_data_min_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
+    """近期轨迹窗口里 production（外部真实）来源的最低占比；低于该值
+    doctor 报『外部信号消失风险』info。默认 0.0 = 仅在全自产时告警
+    （观测先行，不设硬门）。"""
+
+
+class GovernanceConfig(BaseModel):
+    """治理参数（U2 执行门 / U4 断路器）。
+
+    ``frozen=True``：实例属性运行期不可突变（pydantic v2 对 frozen
+    模型的属性赋值抛 ``ValidationError``）——治理预算与开关必须放在
+    RSI 可改对象（基因组/插件/记忆库）之外，靠不可变性兜底。整字段
+    重赋值的旁路由 U4 的 Governor 构造期快照防（本单元仅声明）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    max_inject_chars: int = Field(default=12000, ge=2000)
+    """单轮系统提示注入渲染的**绝对**字符上限（执行门绝对预算臂）。
+    只设绝对臂不设相对臂：相对臂（父代渲染 × 系数）在隔离栈上父代
+    渲染仅 ~160 chars 时阈值过低，等价于禁止一切内容增量候选。"""
+    max_deploys_per_hour: int = Field(default=6, ge=0)
+    """滚动 1 小时窗口内最多部署次数（治理断路器；超出即拒）。"""
+    min_deploy_interval_s: float = Field(default=300.0, ge=0.0)
+    """两次部署的最小冷却间隔（秒）。"""
+    consecutive_deploy_limit: int = Field(default=8, ge=1)
+    """连续部署（中间无回滚）轮数上限；触顶即拒并置 deployment_pause
+    （人工清 governor.json 恢复）。"""
+    quality_rollback_window: int = Field(default=20, ge=1)
+    """质量回归判定的部署后轨迹窗口（条）。"""
+    quality_rollback_drop: float = Field(default=0.1, ge=0.0, le=1.0)
+    """窗口均值较部署前下滑超过该值 → 自动回滚 + 暂停部署。"""
+    min_traces_after_deploy: int = Field(default=5, ge=1)
+    """质量回归判定所需的最少部署后带结局轨迹数（不足不判）。"""
 
 
 class TelemetryConfig(BaseModel):
@@ -177,6 +218,7 @@ class RSIMemConfig(BaseModel):
     rsi: RSIConfig = Field(default_factory=RSIConfig)
     proxy: ProxyConfig = Field(default_factory=ProxyConfig)
     wiki: WikiConfig = Field(default_factory=WikiConfig)
+    governance: GovernanceConfig = Field(default_factory=GovernanceConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     backend_model: ChatModelBase | None = None
     """记忆提取 / RSI 评审等后台任务专用模型；``None`` 时复用 Agent
@@ -214,6 +256,7 @@ class RSIMemConfig(BaseModel):
             "review": self.review.model_dump(),
             "rsi": self.rsi.model_dump(),
             "wiki": self.wiki.model_dump(),
+            "governance": self.governance.model_dump(),
             "telemetry": self.telemetry.model_dump(),
             "has_backend_model": self.backend_model is not None,
             "has_embedding_model": self.embedding_model is not None,
